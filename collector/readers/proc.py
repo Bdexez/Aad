@@ -74,7 +74,7 @@ class ProcReader(Reader):
         """Compteurs individuels en jiffies, sans doubler guest/guest_nice."""
         try:
             content = (self.root / "stat").read_text()
-        except OSError:
+        except (OSError, UnicodeError):
             return {}
         out: dict[str, tuple[int, ...]] = {}
         for line in content.splitlines():
@@ -96,7 +96,7 @@ class ProcReader(Reader):
     def _meminfo(self) -> dict[str, int]:
         try:
             content = (self.root / "meminfo").read_text()
-        except OSError:
+        except (OSError, UnicodeError):
             return {}
         out: dict[str, int] = {}
         for line in content.splitlines():

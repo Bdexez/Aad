@@ -97,9 +97,9 @@ def _interrupt_totals(path: pathlib.Path = PROC / "interrupts") -> dict[str, int
             continue
         total = 0
         for token in rest.split():
-            if token.lstrip("-").isdigit():
+            try:
                 total += int(token)
-            else:
+            except ValueError:
                 break  # la suite est la description textuelle
         totals[label] = total
     return totals
@@ -242,8 +242,10 @@ class ErrorCounterReader(Reader):
         out = {}
         for line in text.splitlines():
             key, _, value = line.partition(" ")
-            if value.strip().lstrip("-").isdigit():
-                out[key] = int(value)
+            try:
+                out[key] = int(value.strip())
+            except ValueError:
+                continue
         return out
 
     def setup(self) -> bool:

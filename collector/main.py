@@ -310,7 +310,10 @@ class Collector:
 
 
 def _cpu_model() -> str:
-    text = pathlib.Path("/proc/cpuinfo").read_text() if pathlib.Path("/proc/cpuinfo").exists() else ""
+    try:
+        text = pathlib.Path("/proc/cpuinfo").read_text(errors="replace")
+    except OSError:
+        return platform.machine()
     for line in text.splitlines():
         if line.startswith("model name"):
             return line.split(":", 1)[1].strip()

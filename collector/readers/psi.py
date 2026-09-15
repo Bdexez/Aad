@@ -60,7 +60,7 @@ class PsiReader(Reader):
     def _parse(path: pathlib.Path) -> dict[str, float]:
         try:
             content = path.read_text()
-        except OSError:
+        except (OSError, UnicodeError):
             return {}
         out: dict[str, float] = {}
         for raw in content.splitlines():

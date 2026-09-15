@@ -48,6 +48,13 @@ class PsiTest(unittest.TestCase):
     def test_psi_disabled_kernel(self):
         self.assertFalse(PsiReader(root=self.root).setup())
 
+    def test_invalid_utf8_in_psi_returns_none(self):
+        write(self.root / "cpu", PSI)
+        reader = PsiReader(root=self.root)
+        self.assertTrue(reader.setup())
+        (self.root / "cpu").write_bytes(b"some avg10=\xff\n")
+        self.assertEqual(reader.read(), {"psi_cpu_some": None})
+
 
 class ProcTest(unittest.TestCase):
     def setUp(self):
@@ -164,6 +171,17 @@ class ProcTest(unittest.TestCase):
 
     def test_missing_proc_disables_reader(self):
         self.assertFalse(ProcReader(root=self.root / "absent").setup())
+
+    def test_invalid_utf8_in_stat_and_meminfo_returns_null_metrics(self):
+        reader = ProcReader(root=self.root)
+        self.assertTrue(reader.setup())
+        (self.root / "stat").write_bytes(b"\xff\xfe")
+        (self.root / "meminfo").write_bytes(b"\xff\xfe")
+        out = reader.read()
+        self.assertIsNone(out["cpu_util"])
+        self.assertIsNone(out["mem_used_mb"])
+        self.assertIsNone(out["swap_used_mb"])
+        self.assertEqual(out["load1"], 0.51)
 
 
 class ContextTest(unittest.TestCase):

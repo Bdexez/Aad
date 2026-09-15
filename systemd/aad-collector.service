@@ -1,26 +1,26 @@
-# Installation (dépôt présent dans /opt/bad) :
-#   sudo cp systemd/bad-collector.service /etc/systemd/system/
-#   sudo systemctl daemon-reload && sudo systemctl enable --now bad-collector
+# Installation (dépôt présent dans /opt/aad) :
+#   sudo cp systemd/aad-collector.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now aad-collector
 #
 # Root est requis pour un seul capteur : RAPL (energy_uj en 0400 depuis
 # Platypus). Tout le reste tourne en utilisateur ordinaire — si la puissance
 # CPU ne t'intéresse pas, lance le collector sans systemd et sans root.
 
 [Unit]
-Description=BAD — collecte de télémétrie matérielle à 1 Hz
+Description=AAD — collecte de télémétrie matérielle à 1 Hz
 
 [Service]
 Type=simple
-StateDirectory=bad
-WorkingDirectory=/opt/bad
-ExecStart=/usr/bin/python3 -m collector.main --db /var/lib/bad/metrics.db --period 1.0
+StateDirectory=aad
+WorkingDirectory=/opt/aad
+ExecStart=/usr/bin/python3 -m collector.main --db /var/lib/aad/metrics.db --period 1.0
 Restart=always
 RestartSec=5
 
 # Le daemon lit /proc, /sys et écrit dans son répertoire de données.
 ProtectHome=read-only
 ProtectSystem=strict
-ReadWritePaths=/var/lib/bad
+ReadWritePaths=/var/lib/aad
 PrivateTmp=yes
 NoNewPrivileges=yes
 # Priorité basse : mesurer la machine ne doit pas perturber ce qu'on mesure.

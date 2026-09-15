@@ -96,7 +96,7 @@ def dataset_report(
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="État et complétude du dataset BAD")
+    parser = argparse.ArgumentParser(description="État et complétude du dataset AAD")
     parser.add_argument("--db", default="data/metrics.db", help="base SQLite existante")
     parser.add_argument("--json", action="store_true", help="rapport JSON pour les scripts")
     parser.add_argument("--since", type=int, help="epoch ms inclusif")

@@ -53,7 +53,7 @@ def backup_database(
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Sauvegarder une base BAD pendant la collecte")
+    parser = argparse.ArgumentParser(description="Sauvegarder une base AAD pendant la collecte")
     parser.add_argument("--db", default="data/metrics.db", help="base SQLite existante")
     parser.add_argument("--output", required=True, type=pathlib.Path, help="nouveau fichier de sauvegarde")
     parser.add_argument("--timeout", type=float, default=30.0, help="délai de copie en secondes (défaut : 30)")

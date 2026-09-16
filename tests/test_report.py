@@ -245,3 +245,41 @@ class DatasetReportTest(unittest.TestCase):
         self.assertEqual(result.exception.code, 2)
         self.assertIn("--until doit être supérieur à --since", error.getvalue())
         self.assertNotIn("Traceback", error.getvalue())
+
+    def test_boot_filter_scopes_samples_metrics_and_boots_and_matches_export(self):
+        self.seed()
+        report = dataset_report(self.db, boot_id="a")
+        self.assertEqual(report["boot_id"], "a")
+        self.assertEqual(report["samples"], {
+            "count": 3, "first_ts": 100, "last_ts": 200, "labelled": 3, "labelled_pct": 100.0,
+        })
+        self.assertEqual([boot["boot_id"] for boot in report["boots"]], ["a"])
+        self.assertEqual(report["metrics"], [
+            {"column": "cpu_util", "type": "REAL", "present": 2, "missing": 1, "coverage_pct": 2 / 3 * 100},
+            {"column": "note", "type": "TEXT", "present": 2, "missing": 1, "coverage_pct": 2 / 3 * 100},
+        ])
+        self.assertEqual(export_csv(self.db, io.StringIO(), boot_id="a"), 3)
+
+    def test_boot_filter_combines_with_time_window_and_handles_unknown_boot(self):
+        self.seed()
+        scoped = dataset_report(self.db, boot_id="a", since=150, until=300)
+        self.assertEqual(scoped["samples"]["count"], 1)
+        self.assertEqual(scoped["samples"]["first_ts"], 200)
+        self.assertEqual(export_csv(self.db, io.StringIO(), boot_id="a", since=150, until=300), 1)
+        missing = dataset_report(self.db, boot_id="nonexistent")
+        self.assertEqual(missing["samples"]["count"], 0)
+        self.assertIsNone(missing["samples"]["labelled_pct"])
+        self.assertEqual(missing["boots"], [])
+
+    def test_cli_accepts_boot_filter_in_json_and_text_modes(self):
+        self.seed()
+        args = ["--db", str(self.db), "--boot", "b"]
+        with redirect_stdout(io.StringIO()) as output:
+            report_module.main([*args, "--json"])
+        report = json.loads(output.getvalue())
+        self.assertEqual(report["boot_id"], "b")
+        self.assertEqual(report["samples"]["count"], 1)
+        with redirect_stdout(io.StringIO()) as output:
+            report_module.main(args)
+        self.assertIn("Boot : b", output.getvalue())
+        self.assertIn("Mesures : 1", output.getvalue())

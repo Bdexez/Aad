@@ -19,6 +19,7 @@ def _percentage(part: int, total: int) -> float | None:
 def dataset_report(
     db: str | pathlib.Path,
     *,
+    boot_id: str | None = None,
     since: int | None = None,
     until: int | None = None,
 ) -> dict:
@@ -28,21 +29,29 @@ def dataset_report(
     chargée en mémoire Python. La complétude ne préjuge pas de la validité
     physique d'une mesure, et aucune vérité terrain n'est inférée.
     Les bornes temporelles sont inclusives/exclusives, comme pour l'export.
+    `boot_id` limite les mesures, les métriques et la section `boots` ;
+    `labels` et `events` restent bornés par la fenêtre temporelle.
     """
     if since is not None and until is not None and until <= since:
         raise ValueError("--until doit être supérieur à --since")
-    filters = []
+    time_filters = []
     label_filters = []
-    params: list[int] = []
+    time_params: list[int] = []
     for value, condition, label_condition in (
         (since, "ts >= ?", "(ts_end IS NULL OR ts_end > ?)"),
         (until, "ts < ?", "ts_start < ?"),
     ):
         if value is not None:
-            filters.append(condition)
+            time_filters.append(condition)
             label_filters.append(label_condition)
-            params.append(value)
-    where = " WHERE " + " AND ".join(filters) if filters else ""
+            time_params.append(value)
+    sample_filters = list(time_filters)
+    sample_params: list[str | int] = list(time_params)
+    if boot_id is not None:
+        sample_filters.insert(0, "boot_id = ?")
+        sample_params.insert(0, boot_id)
+    sample_where = " WHERE " + " AND ".join(sample_filters) if sample_filters else ""
+    event_where = " WHERE " + " AND ".join(time_filters) if time_filters else ""
     # Une fenêtre vide ne peut pas intersecter la période demandée. Sans
     # filtre, le rapport conserve le décompte de tous les labels enregistrés.
     label_where = (" WHERE (ts_end IS NULL OR ts_start < ts_end) AND "
@@ -55,31 +64,32 @@ def dataset_report(
         count, first, last, labelled = conn.execute(
             "SELECT COUNT(*), MIN(s.ts), MAX(s.ts), COALESCE(SUM(EXISTS("
             " SELECT 1 FROM labels AS l WHERE l.ts_start <= s.ts"
-            " AND (l.ts_end IS NULL OR s.ts < l.ts_end))), 0) FROM samples AS s" + where,
-            params,
+            " AND (l.ts_end IS NULL OR s.ts < l.ts_end))), 0) FROM samples AS s" + sample_where,
+            sample_params,
         ).fetchone()
         counts = ()
         if metrics:
             counts = conn.execute(
                 "SELECT " + ", ".join(f"COUNT({quote_identifier(field[1])})" for field in metrics)
-                + " FROM samples" + where,
-                params,
+                + " FROM samples" + sample_where,
+                sample_params,
             ).fetchone()
         boots = conn.execute(
             "SELECT boot_id, COUNT(*), MIN(ts), MAX(ts), COUNT(*) - COUNT(DISTINCT ts)"
-            " FROM samples" + where + " GROUP BY boot_id ORDER BY boot_id",
-            params,
+            " FROM samples" + sample_where + " GROUP BY boot_id ORDER BY boot_id",
+            sample_params,
         ).fetchall()
         total_labels, open_labels = conn.execute(
             "SELECT COUNT(*), COALESCE(SUM(ts_end IS NULL), 0) FROM labels" + label_where,
-            params,
+            time_params,
         ).fetchone()
         events = conn.execute(
-            "SELECT source, kind, severity, COUNT(*) FROM events" + where
+            "SELECT source, kind, severity, COUNT(*) FROM events" + event_where
             + " GROUP BY source, kind, severity ORDER BY source, kind, severity",
-            params,
+            time_params,
         ).fetchall()
         return {
+            "boot_id": boot_id,
             "window": {"since": since, "until": until},
             "samples": {"count": count, "first_ts": first, "last_ts": last,
                         "labelled": labelled, "labelled_pct": _percentage(labelled, count)},
@@ -99,17 +109,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="État et complétude du dataset AAD")
     parser.add_argument("--db", default="data/metrics.db", help="base SQLite existante")
     parser.add_argument("--json", action="store_true", help="rapport JSON pour les scripts")
+    parser.add_argument("--boot", dest="boot_id", help="limiter les mesures à un boot_id")
     parser.add_argument("--since", type=int, help="epoch ms inclusif")
     parser.add_argument("--until", type=int, help="epoch ms exclusif")
     args = parser.parse_args(argv)
     try:
-        report = dataset_report(args.db, since=args.since, until=args.until)
+        report = dataset_report(args.db, boot_id=args.boot_id, since=args.since, until=args.until)
     except (ValueError, OSError, sqlite3.Error) as exc:
         parser.error(str(exc))
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return
     samples = report["samples"]
+    if args.boot_id is not None:
+        print(f"Boot : {args.boot_id}")
     if args.since is not None or args.until is not None:
         start = "sans borne" if args.since is None else str(args.since)
         end = "sans borne" if args.until is None else str(args.until)

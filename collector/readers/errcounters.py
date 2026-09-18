@@ -116,9 +116,10 @@ class ErrorCounterReader(Reader):
 
     name = "errcounters"
 
-    def __init__(self, proc: pathlib.Path = PROC, sys_root: pathlib.Path = SYS):
+    def __init__(self, proc: pathlib.Path = PROC, sys_root: pathlib.Path = SYS, boot: str = ""):
         self.proc = proc
         self.sys = sys_root
+        self.boot = boot
         self.fields = []
         self.counters: list[Counter] = []
         self._prev: dict[str, int] = {}
@@ -262,11 +263,13 @@ class ErrorCounterReader(Reader):
             self._prev[counter.field] = value
             if value > 0:
                 # État de départ : une machine qui compte déjà 4 000 erreurs ECC
-                # depuis le boot doit le dire, pas attendre la 4 001e.
+                # depuis le boot doit le dire, pas attendre la 4 001e. La clé
+                # dedup rend les redémarrages du daemon idempotents sur le même boot.
                 self.emit(
                     counter.kind,
                     message=f"{counter.field}={value} au démarrage du collector",
                     severity=errors.WARNING,
+                    dedup=f"{self.boot}:errcounters:init:{counter.field}" if self.boot else None,
                 )
 
         self._nvme_states = {p: "" for p in sorted(self.sys.glob("class/nvme/nvme*/state"))}

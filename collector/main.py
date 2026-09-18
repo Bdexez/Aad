@@ -63,7 +63,7 @@ def candidate_readers(boot: str = "") -> list[Reader]:
     """
     return [
         R.KmsgReader(boot=boot),
-        R.ErrorCounterReader(),
+        R.ErrorCounterReader(boot=boot),
         R.K10TempReader(),
         R.GigabyteWmiReader(),
         R.RaplReader(),
@@ -390,7 +390,7 @@ def run_scan(top: int = 6) -> None:
         found.append((kind, severity, message))
         return True
 
-    for reader in (R.KmsgReader(boot="scan"), R.ErrorCounterReader()):
+    for reader in (R.KmsgReader(boot="scan"), R.ErrorCounterReader(boot="scan")):
         reader.emitter = collect
         try:
             if not reader.setup():

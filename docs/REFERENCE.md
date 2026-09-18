@@ -248,7 +248,7 @@ from shrinking until the export finishes.
 
 ```bash
 python -m collector.report --db data/metrics.db
-python -m collector.report --db data/metrics.db --json
+python -m collector.report --db data/metrics.db --boot BOOT_ID --json
 python -m collector.report --db data/metrics.db \
   --since 1794300000000 --until 1794386400000 --json
 ```
@@ -259,19 +259,46 @@ Annotation coverage uses the same `[start, end)` windows as export and counts
 overlapping labels once per sample. Boot summaries include sample windows and
 repeated timestamps; events are grouped by source, kind and severity.
 
-Optional `--since` and `--until` use epoch milliseconds and select `[since, until)`;
-either bound can be omitted. They filter samples, metric coverage, boot summaries
-and event timestamps. With a time filter, label counts include non-empty windows
-that intersect the requested interval, including windows that began earlier or
-have no samples. The open count describes windows still open in the stored
-snapshot. Without a time filter, all stored labels are counted. The JSON `window`
-object records both requested bounds (`null` for an omitted bound); a text report
-prints them when a filter is active. Reversed or empty ranges are rejected.
+Optional `--boot`, `--since` and `--until` filter the report. `--boot` scopes
+samples, metric coverage and boot summaries to a single `boot_id`, matching
+`collector.export`; events and labels remain scoped by `--since`/`--until`.
+`--since` and `--until` use epoch milliseconds and select `[since, until)`;
+either bound can be omitted. With a time filter, label counts include non-empty
+windows that intersect the requested interval, including windows that began
+earlier or have no samples. The open count describes windows still open in the
+stored snapshot. Without a time filter, all stored labels are counted. The JSON
+`window` object records both requested bounds (`null` for an omitted bound) and
+`boot_id` records the requested boot filter; a text report prints them when
+active. Reversed or empty ranges are rejected.
 
 All sections use one read-only snapshot and SQL aggregations. Samples are not
 loaded into Python memory, legacy schemas are not migrated, and no `normal`
 label or anomaly score is inferred. Completeness measures availability, not
 sensor accuracy.
+
+### Exploratory dataset analysis
+
+```bash
+python -m collector.analyze --db data/metrics.db
+python -m collector.analyze --db data/metrics.db --boot BOOT_ID --gap-factor 2.5 --json
+python -m collector.analyze --db data/metrics.db --compare normal airflow_blocked
+```
+
+`collector.analyze` inspects a read-only SQLite snapshot without migrating the
+database:
+
+- **Cadence per boot**: sample count, interval count, `min`/`median`/`p95`/`max`/`mean`
+  inter-sample intervals in ms, duplicate timestamps (`dt == 0`), clock
+  regressions (`dt < 0`) and gaps (`dt > gap_factor * median_dt_ms`).
+- **Numeric metric statistics**: SQL-computed `present`, `missing`, `coverage_pct`,
+  `min`, `max`, `mean`, sample `std` (`ddof=1`, `null` for `n < 2`) and
+  `is_constant` to flag stuck sensors. Text columns are excluded.
+- **Label summary**: per-label window counts, open windows, closed duration,
+  deduplicated sample counts and event counts.
+- **Label comparison (`--compare BASELINE TARGET`)**: compares numeric metrics
+  between two labelled experiments, reporting `delta_mean`, standardized shift
+  `z_shift = (target_mean - baseline_mean) / baseline_std`, and
+  `overlap_samples` so mixed windows are visible immediately.
 
 ### Backing up during collection
 

@@ -15,7 +15,9 @@ expérience où l'on a oublié de noter l'id.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 import datetime as dt
+import json
 import pathlib
 import sqlite3
 
@@ -41,7 +43,7 @@ def human(ts_ms: int | None) -> str:
     return dt.datetime.fromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="Annotation des expériences (table labels)")
     ap.add_argument("--db", default="data/metrics.db")
     ap.add_argument("--schema", type=pathlib.Path, default=SCHEMA)
@@ -56,8 +58,10 @@ def main() -> None:
 
     listing = sub.add_parser("list", help="lister les fenêtres ouvertes")
     listing.add_argument("--all", action="store_true", help="inclure les fenêtres terminées")
+    listing.add_argument("--label", help="filtrer sur un nom de label exact")
+    listing.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
 
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if args.command == "start":
         args.label = args.label.strip()
         if not args.label:
@@ -67,28 +71,31 @@ def main() -> None:
             ap.error(f"base introuvable: {args.db}")
         if args.command == "end" and args.id is not None and args.id <= 0:
             ap.error("l'identifiant du label doit être > 0")
-    storage = None
     try:
-        storage = Storage(args.db, args.schema)
-        if args.command == "start":
-            if args.label not in KNOWN_LABELS:
-                print(f"note: '{args.label}' hors liste ({', '.join(KNOWN_LABELS)})")
-            label_id = storage.start_label(now_ms(), args.label, args.notes)
-            print(f"label {label_id} ouvert: {args.label}")
-        elif args.command == "end":
-            closed = storage.end_label(now_ms(), args.id)
-            print(f"{closed} label(s) fermé(s)")
-        else:
-            rows = storage.list_labels(include_closed=args.all)
-            if not rows:
-                print("aucun label" if args.all else "aucun label ouvert")
-            for row in rows:
-                print(f"#{row[0]}  {human(row[1])} → {human(row[2])}  {row[3]}  {row[4]}")
+        with Storage(args.db, args.schema) as storage:
+            if args.command == "start":
+                if args.label not in KNOWN_LABELS:
+                    print(f"note: '{args.label}' hors liste ({', '.join(KNOWN_LABELS)})")
+                label_id = storage.start_label(now_ms(), args.label, args.notes)
+                print(f"label {label_id} ouvert: {args.label}")
+            elif args.command == "end":
+                closed = storage.end_label(now_ms(), args.id)
+                print(f"{closed} label(s) fermé(s)")
+            else:
+                rows = storage.list_labels(include_closed=args.all, label=args.label)
+                if args.json:
+                    payload = [
+                        {"id": r[0], "ts_start": r[1], "ts_end": r[2], "label": r[3], "notes": r[4]}
+                        for r in rows
+                    ]
+                    print(json.dumps(payload, ensure_ascii=False, indent=2))
+                else:
+                    if not rows:
+                        print("aucun label" if args.all else "aucun label ouvert")
+                    for row in rows:
+                        print(f"#{row[0]}  {human(row[1])} → {human(row[2])}  {row[3]}  {row[4]}")
     except (ValueError, OSError, sqlite3.Error) as exc:
         ap.error(str(exc))
-    finally:
-        if storage is not None:
-            storage.close()
 
 
 if __name__ == "__main__":

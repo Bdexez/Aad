@@ -256,11 +256,19 @@ class Storage:
                 self.conn.execute("ROLLBACK")
             raise
 
-    def list_labels(self, include_closed: bool = False) -> list[tuple]:
-        where = "" if include_closed else " WHERE ts_end IS NULL"
+    def list_labels(self, include_closed: bool = False, *, label: str | None = None) -> list[tuple]:
+        filters: list[str] = []
+        params: list[str] = []
+        if not include_closed:
+            filters.append("ts_end IS NULL")
+        if label is not None:
+            filters.append("label = ?")
+            params.append(label)
+        where = " WHERE " + " AND ".join(filters) if filters else ""
         return self.conn.execute(
             "SELECT id, ts_start, ts_end, label, notes FROM labels" + where
-            + " ORDER BY ts_start, id"
+            + " ORDER BY ts_start, id",
+            params,
         ).fetchall()
 
     def open_labels(self) -> list[sqlite3.Row]:
@@ -272,6 +280,12 @@ class Storage:
 
     def count_samples(self) -> int:
         return int(self.conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0])
+
+    def __enter__(self) -> Storage:
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.close()
 
     def close(self) -> None:
         try:

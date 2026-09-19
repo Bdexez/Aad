@@ -294,6 +294,14 @@ class StorageTest(unittest.TestCase):
         row = self.storage.conn.execute("SELECT source, kind, message FROM events").fetchone()
         self.assertEqual(row, ("collector", "reader_fail", "nvml: boom"))
 
+    def test_storage_supports_context_manager(self):
+        path = self.db.with_name("ctx.db")
+        with Storage(path, SCHEMA) as storage:
+            storage.insert_samples([{"ts": 1, "boot_id": "a"}])
+            self.assertEqual(storage.count_samples(), 1)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            storage.conn.execute("SELECT 1")
+
 
 if __name__ == "__main__":
     unittest.main()

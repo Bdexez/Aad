@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from collector.export import export_csv
+from collector.export import export_csv, export_events, export_jsonl
 from collector.main import SCHEMA
 from collector.storage import Storage
 
@@ -139,3 +139,38 @@ class ExportTest(unittest.TestCase):
         output = io.StringIO()
         self.assertEqual(export_csv(self.db, output), 0)
         self.assertIn("sample_id,ts,boot_id,temperature,note,labels_json\n", output.getvalue())
+
+    def test_export_jsonl_preserves_native_types_nulls_and_labels(self):
+        self.storage.insert_samples([
+            {"ts": 100, "boot_id": "a", "temperature": 42.5, "note": "ok"},
+            {"ts": 200, "boot_id": "a", "temperature": None, "note": None},
+        ])
+        w = self.storage.start_label(100, "normal", "baseline")
+        self.storage.end_label(150, w)
+        output = io.StringIO()
+        self.assertEqual(export_jsonl(self.db, output), 2)
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(records[0]["temperature"], 42.5)
+        self.assertEqual(records[0]["labels"][0]["label"], "normal")
+        self.assertIsNone(records[1]["temperature"])
+        self.assertEqual(records[1]["labels"], [])
+
+    def test_export_events_supports_csv_jsonl_and_filters(self):
+        self.storage.add_event(100, "kmsg", "gpu_reset", "critical", "hang", "b:1")
+        self.storage.add_event(200, "collector", "start", "info", "period=1.0s")
+        self.storage.add_event(300, "kmsg", "mce", "error", "corrected", "b:2")
+
+        csv_out = io.StringIO()
+        self.assertEqual(export_events(self.db, csv_out, fmt="csv", source="kmsg"), 2)
+        rows = list(csv.DictReader(io.StringIO(csv_out.getvalue())))
+        self.assertEqual([r["kind"] for r in rows], ["gpu_reset", "mce"])
+
+        jsonl_out = io.StringIO()
+        self.assertEqual(
+            export_events(self.db, jsonl_out, fmt="jsonl", since=100, until=300, severity="critical"),
+            1,
+        )
+        records = [json.loads(line) for line in jsonl_out.getvalue().splitlines()]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["kind"], "gpu_reset")
+        self.assertEqual(records[0]["ts"], 100)

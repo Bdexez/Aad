@@ -52,10 +52,12 @@ For unattended collection, see the [systemd unit](systemd/aad-collector.service)
 
 ```bash
 python -m collector.export --db data/metrics.db --output data/dataset.csv
+python -m collector.export --db data/metrics.db --format jsonl --output data/dataset.jsonl
 python -m collector.export --db data/metrics.db --boot BOOT_ID --columns ts cpu_util mem_used_mb
+python -m collector.export --db data/metrics.db --events --severity critical --format jsonl
 ```
 
-The export reads a consistent snapshot while collection continues, without modifying or migrating the database. It writes one CSV row per sample and a `labels_json` column containing every matching experiment, its notes and time boundaries. An empty array means no annotation; no label is guessed. Missing measurements become empty CSV cells.
+The export reads a consistent snapshot while collection continues, without modifying or migrating the database. In CSV mode it writes one row per sample and a `labels_json` column containing every matching experiment, its notes and time boundaries; in `--format jsonl` mode it preserves native numeric types and writes matching experiments under `labels`. Use `--events` (with optional `--source`, `--kind`, `--severity`) to export the discrete fault log. An empty array means no annotation; no label is guessed. Missing measurements become empty CSV cells or JSON `null`.
 
 Use `--since` and `--until` for an inclusive/exclusive range in epoch milliseconds. Output defaults to stdout; `--output` creates a new file and refuses to overwrite an existing one. See the [export reference](docs/REFERENCE.md#exporting-data) for examples.
 
@@ -80,10 +82,11 @@ Inspect sampling cadence, numeric distributions, constant sensors and experiment
 ```bash
 python -m collector.analyze --db data/metrics.db
 python -m collector.analyze --db data/metrics.db --compare normal airflow_blocked
+python -m collector.analyze --db data/metrics.db --correlate k10temp_tctl
 python -m collector.analyze --db data/metrics.db --boot BOOT_ID --json
 ```
 
-The analyzer runs on a read-only SQLite snapshot without migrating the database. It reports per-boot sampling intervals (median, p95, gaps, duplicate timestamps and clock regressions), SQL-computed numeric `min`/`max`/`mean`/`std` with constant-sensor flags, per-label sample and event counts, and standardized shifts (`z_shift`) between two labelled experiments.
+The analyzer runs on a read-only SQLite snapshot without migrating the database. It reports per-boot sampling intervals (median, p95, gaps, duplicate timestamps and clock regressions), SQL-computed numeric `min`/`max`/`mean`/`std` with constant-sensor flags, per-label sample and event counts, standardized shifts (`z_shift`) between two labelled experiments, and pairwise Pearson correlations (`--correlate`) against a target metric.
 
 ## Back up an active collection
 

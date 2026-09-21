@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 from collector import analyze as analyze_module
-from collector.analyze import analyze_dataset, compare_labels
+from collector.analyze import analyze_dataset, compare_labels, correlate_metric
 from collector.main import SCHEMA
 from collector.storage import Storage
 
@@ -194,6 +194,33 @@ class AnalyzeDatasetTest(unittest.TestCase):
             analyze_module.main(["--db", str(self.db), "--gap-factor", "0.5"])
         self.assertEqual(exc.exception.code, 2)
         self.assertIn("--gap-factor", err.getvalue())
+
+    def test_correlate_metric_computes_exact_pairwise_pearson_and_handles_nulls(self):
+        self.storage.ensure_columns(["power_w", "fan_rpm"])
+        self.storage.insert_samples([
+            {"ts": 1000, "boot_id": "a", "temp_c": 40.0, "power_w": 20.0, "fan_rpm": 1200.0, "stuck": 5.0},
+            {"ts": 2000, "boot_id": "a", "temp_c": 50.0, "power_w": 30.0, "fan_rpm": 1000.0, "stuck": 5.0},
+            {"ts": 3000, "boot_id": "a", "temp_c": 60.0, "power_w": 40.0, "fan_rpm": 800.0, "stuck": 5.0},
+            {"ts": 4000, "boot_id": "a", "temp_c": 70.0, "power_w": None, "fan_rpm": 600.0, "stuck": 5.0},
+        ])
+        res = correlate_metric(self.db, "temp_c")
+        by_col = {item["column"]: item for item in res["correlations"]}
+        self.assertAlmostEqual(by_col["power_w"]["r"], 1.0)
+        self.assertEqual(by_col["power_w"]["pairs"], 3)
+        self.assertAlmostEqual(by_col["fan_rpm"]["r"], -1.0)
+        self.assertEqual(by_col["fan_rpm"]["pairs"], 4)
+        self.assertIsNone(by_col["stuck"]["r"])
+        self.assertNotIn("note", by_col)
+
+        with self.assertRaises(ValueError):
+            correlate_metric(self.db, "note")
+        with self.assertRaises(ValueError):
+            correlate_metric(self.db, "temp_c", min_pairs=1)
+
+        with redirect_stdout(io.StringIO()) as out:
+            analyze_module.main(["--db", str(self.db), "--correlate", "temp_c"])
+        self.assertIn("Corrélations de Pearson avec temp_c", out.getvalue())
+        self.assertIn("power_w : r=1.000", out.getvalue())
 
 
 if __name__ == "__main__":

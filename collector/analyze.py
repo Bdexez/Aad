@@ -15,7 +15,7 @@ import math
 import pathlib
 import sqlite3
 
-from .database import read_snapshot
+from .database import read_snapshot, sample_filter_sql, validate_time_range
 from .storage import quote_identifier
 
 _META_COLUMNS = frozenset({"sample_id", "ts", "boot_id"})
@@ -37,33 +37,6 @@ def _quantile(sorted_values: list[int], q: float) -> float | None:
     if lo == hi:
         return float(sorted_values[lo])
     return sorted_values[lo] + (sorted_values[hi] - sorted_values[lo]) * (pos - lo)
-
-
-def _validate_range(since: int | None, until: int | None) -> None:
-    if since is not None and until is not None and until <= since:
-        raise ValueError("--until doit être supérieur à --since")
-
-
-def _sample_filter_sql(
-    boot_id: str | None,
-    since: int | None,
-    until: int | None,
-    alias: str = "",
-) -> tuple[str, list[str | int]]:
-    prefix = f"{alias}." if alias else ""
-    filters: list[str] = []
-    params: list[str | int] = []
-    if boot_id is not None:
-        filters.append(f"{prefix}boot_id = ?")
-        params.append(boot_id)
-    if since is not None:
-        filters.append(f"{prefix}ts >= ?")
-        params.append(since)
-    if until is not None:
-        filters.append(f"{prefix}ts < ?")
-        params.append(until)
-    where = " WHERE " + " AND ".join(filters) if filters else ""
-    return where, params
 
 
 def _numeric_metrics(conn: sqlite3.Connection) -> tuple[list[tuple[str, str]], str]:
@@ -275,10 +248,10 @@ def analyze_dataset(
     gap_factor: float = 2.0,
 ) -> dict:
     """Analyse exploratoire sur un snapshot SQLite cohérent en lecture seule."""
-    _validate_range(since, until)
+    validate_time_range(since, until)
     if not math.isfinite(gap_factor) or gap_factor <= 1.0:
         raise ValueError("--gap-factor doit être un nombre fini > 1")
-    where, params = _sample_filter_sql(boot_id, since, until, alias="s")
+    where, params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
     with read_snapshot(db) as conn:
         metrics, order_col = _numeric_metrics(conn)
         total_samples = conn.execute(
@@ -313,8 +286,8 @@ def compare_labels(
     target_label = target_label.strip()
     if not baseline_label or not target_label:
         raise ValueError("les noms de labels à comparer ne peuvent pas être vides")
-    _validate_range(since, until)
-    base_where, base_params = _sample_filter_sql(boot_id, since, until, alias="s")
+    validate_time_range(since, until)
+    base_where, base_params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
     label_exists = (
         "EXISTS (SELECT 1 FROM labels AS l WHERE l.label = ?"
         " AND l.ts_start <= s.ts AND (l.ts_end IS NULL OR s.ts < l.ts_end))"
@@ -387,8 +360,8 @@ def correlate_metric(
     """
     if min_pairs < 2:
         raise ValueError("--min-pairs doit être >= 2")
-    _validate_range(since, until)
-    where, params = _sample_filter_sql(boot_id, since, until, alias="s")
+    validate_time_range(since, until)
+    where, params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
     with read_snapshot(db) as conn:
         metrics, _ = _numeric_metrics(conn)
         numeric_names = [name for name, _ in metrics]

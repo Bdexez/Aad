@@ -8,7 +8,7 @@ import json
 import pathlib
 import sqlite3
 
-from .database import read_snapshot
+from .database import read_snapshot, sample_filter_sql, validate_time_range
 from .storage import quote_identifier
 
 
@@ -32,8 +32,7 @@ def dataset_report(
     `boot_id` limite les mesures, les métriques et la section `boots` ;
     `labels` et `events` restent bornés par la fenêtre temporelle.
     """
-    if since is not None and until is not None and until <= since:
-        raise ValueError("--until doit être supérieur à --since")
+    validate_time_range(since, until)
     time_filters = []
     label_filters = []
     time_params: list[int] = []
@@ -45,12 +44,7 @@ def dataset_report(
             time_filters.append(condition)
             label_filters.append(label_condition)
             time_params.append(value)
-    sample_filters = list(time_filters)
-    sample_params: list[str | int] = list(time_params)
-    if boot_id is not None:
-        sample_filters.insert(0, "boot_id = ?")
-        sample_params.insert(0, boot_id)
-    sample_where = " WHERE " + " AND ".join(sample_filters) if sample_filters else ""
+    sample_where, sample_params = sample_filter_sql(boot_id=boot_id, since=since, until=until)
     event_where = " WHERE " + " AND ".join(time_filters) if time_filters else ""
     # Une fenêtre vide ne peut pas intersecter la période demandée. Sans
     # filtre, le rapport conserve le décompte de tous les labels enregistrés.

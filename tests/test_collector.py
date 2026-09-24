@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from contextlib import contextmanager, redirect_stderr
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import io
+import json
 import pathlib
 import sqlite3
 import subprocess
@@ -481,3 +482,33 @@ class CollectorTest(unittest.TestCase):
         collector.flush([collector.tick(), collector.tick()])
         self.assertEqual(self.query("SELECT value, note, bad_text FROM samples ORDER BY sample_id"),
                          [(1.0, "ok", None), (2.0, "ok", None)])
+
+    def test_doctor_and_scan_support_json_output_and_json_requires_diagnostic_flag(self):
+        reader = CountingReader()
+        with mock.patch.object(main_module, "candidate_readers", return_value=[reader]), \
+             redirect_stdout(io.StringIO()) as out:
+            main_module.run_doctor(as_json=True)
+        doc = json.loads(out.getvalue())
+        self.assertEqual(doc["readers"], [{"name": "counting", "status": "ok", "fields": ["value", "note"], "error": None}])
+        self.assertIn("error_detection", doc)
+
+        class EmittingReader(CountingReader):
+            def setup(self):
+                self.emit("mce", "boom", "critical")
+                return True
+
+        with mock.patch.object(main_module.R, "KmsgReader", return_value=EmittingReader()), \
+             mock.patch.object(main_module.R, "ErrorCounterReader", return_value=CountingReader()), \
+             redirect_stdout(io.StringIO()) as out:
+            main_module.run_scan(as_json=True)
+        scan = json.loads(out.getvalue())
+        self.assertEqual(scan["total"], 1)
+        self.assertEqual(scan["criticals"], 1)
+        self.assertEqual(scan["groups"][0]["kind"], "mce")
+
+        with mock.patch("sys.argv", ["collector", "--json"]), \
+             redirect_stderr(io.StringIO()) as err, \
+             self.assertRaises(SystemExit) as exc:
+            main_module.main()
+        self.assertEqual(exc.exception.code, 2)
+        self.assertIn("--json nécessite --doctor ou --scan", err.getvalue())

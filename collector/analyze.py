@@ -525,6 +525,92 @@ def detect_outliers(
     }
 
 
+def audit_labels(
+    db: str | pathlib.Path,
+    *,
+    boot_id: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+) -> dict:
+    """Vérifie la qualité des fenêtres d'annotations avant entraînement.
+
+    Signale les fenêtres vides, ouvertes, sans aucune mesure associée, et les
+    chevauchements (en distinguant les chevauchements entre labels distincts).
+    """
+    validate_time_range(since, until)
+    where, params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
+    prefix = (where + " AND ") if where else " WHERE "
+    with read_snapshot(db) as conn:
+        _numeric_metrics(conn)  # valide la présence de samples
+        rows = conn.execute(
+            "SELECT id, ts_start, ts_end, label, notes FROM labels ORDER BY ts_start, id"
+        ).fetchall()
+        windows = [
+            {"id": r[0], "ts_start": r[1], "ts_end": r[2], "label": r[3], "notes": r[4]}
+            for r in rows
+        ]
+        empty_windows = [w for w in windows if w["ts_end"] is not None and w["ts_end"] <= w["ts_start"]]
+        open_windows = [w for w in windows if w["ts_end"] is None]
+        non_empty = [w for w in windows if w["ts_end"] is None or w["ts_end"] > w["ts_start"]]
+
+        sampleless_windows = []
+        for w in non_empty:
+            if w["ts_end"] is None:
+                count = conn.execute(
+                    f"SELECT COUNT(*) FROM samples AS s{prefix}s.ts >= ?",
+                    [*params, w["ts_start"]],
+                ).fetchone()[0]
+            else:
+                count = conn.execute(
+                    f"SELECT COUNT(*) FROM samples AS s{prefix}s.ts >= ? AND s.ts < ?",
+                    [*params, w["ts_start"], w["ts_end"]],
+                ).fetchone()[0]
+            if count == 0:
+                sampleless_windows.append(w)
+
+        overlaps = []
+        for i, a in enumerate(non_empty):
+            for b in non_empty[i + 1 :]:
+                if a["ts_end"] is not None and b["ts_start"] >= a["ts_end"]:
+                    break  # trié par ts_start : aucun suivant ne peut chevaucher a
+                if b["ts_end"] is not None and a["ts_start"] >= b["ts_end"]:
+                    continue
+                ov_start = max(a["ts_start"], b["ts_start"])
+                if a["ts_end"] is None:
+                    ov_end = b["ts_end"]
+                elif b["ts_end"] is None:
+                    ov_end = a["ts_end"]
+                else:
+                    ov_end = min(a["ts_end"], b["ts_end"])
+                overlaps.append({
+                    "id_a": a["id"],
+                    "label_a": a["label"],
+                    "id_b": b["id"],
+                    "label_b": b["label"],
+                    "same_label": a["label"] == b["label"],
+                    "overlap_start": ov_start,
+                    "overlap_end": ov_end,
+                })
+
+        cross_label_overlap_samples = conn.execute(
+            "SELECT COUNT(*) FROM samples AS s" + prefix
+            + "(SELECT COUNT(DISTINCT l.label) FROM labels AS l"
+            " WHERE l.ts_start <= s.ts AND (l.ts_end IS NULL OR s.ts < l.ts_end)) > 1",
+            params,
+        ).fetchone()[0]
+
+    return {
+        "boot_id": boot_id,
+        "window": {"since": since, "until": until},
+        "total_windows": len(windows),
+        "empty_windows": empty_windows,
+        "open_windows": open_windows,
+        "sampleless_windows": sampleless_windows,
+        "overlaps": overlaps,
+        "cross_label_overlap_samples": cross_label_overlap_samples,
+    }
+
+
 def _fmt(value: float | None, digits: int = 2) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
 
@@ -549,6 +635,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                       help="corrélations de Pearson entre une métrique cible et les autres sondes")
     mode.add_argument("--outliers", action="store_true",
                       help="détecter les valeurs atypiques par médiane/MAD et IQR")
+    mode.add_argument("--check-labels", action="store_true",
+                      help="auditer les fenêtres d'annotations (vides, ouvertes, chevauchements)")
     parser.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
     args = parser.parse_args(argv)
 
@@ -569,6 +657,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.db, boot_id=args.boot_id, since=args.since, until=args.until,
                 z_threshold=args.z_threshold, columns=args.columns,
             )
+        elif args.check_labels:
+            result = audit_labels(
+                args.db, boot_id=args.boot_id, since=args.since, until=args.until,
+            )
         else:
             result = analyze_dataset(
                 args.db, boot_id=args.boot_id, since=args.since,
@@ -579,6 +671,19 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.check_labels:
+        print(f"Audit des annotations ({result['total_windows']} fenêtre(s)) :")
+        print(f"  Fenêtres vides : {len(result['empty_windows'])}")
+        print(f"  Fenêtres ouvertes : {len(result['open_windows'])}")
+        print(f"  Fenêtres sans mesure : {len(result['sampleless_windows'])}")
+        cross = [ov for ov in result["overlaps"] if not ov["same_label"]]
+        print(
+            f"  Chevauchements : {len(result['overlaps'])} "
+            f"(dont {len(cross)} inter-labels, "
+            f"{result['cross_label_overlap_samples']} mesure(s) multi-labels)"
+        )
         return
 
     if args.outliers:

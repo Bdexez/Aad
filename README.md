@@ -83,10 +83,12 @@ Inspect sampling cadence, numeric distributions, constant sensors and experiment
 python -m collector.analyze --db data/metrics.db
 python -m collector.analyze --db data/metrics.db --compare normal airflow_blocked
 python -m collector.analyze --db data/metrics.db --correlate k10temp_tctl
+python -m collector.analyze --db data/metrics.db --outliers --z-threshold 3.5
+python -m collector.analyze --db data/metrics.db --check-labels
 python -m collector.analyze --db data/metrics.db --boot BOOT_ID --json
 ```
 
-The analyzer runs on a read-only SQLite snapshot without migrating the database. It reports per-boot sampling intervals (median, p95, gaps, duplicate timestamps and clock regressions), SQL-computed numeric `min`/`max`/`mean`/`std` with constant-sensor flags, per-label sample and event counts, standardized shifts (`z_shift`) between two labelled experiments, and pairwise Pearson correlations (`--correlate`) against a target metric.
+The analyzer runs on a read-only SQLite snapshot without migrating the database. It reports per-boot sampling intervals (median, p95, gaps, duplicate timestamps and clock regressions), SQL-computed numeric `min`/`max`/`mean`/`std` with constant-sensor flags, per-label sample and event counts, standardized shifts (`z_shift`) between two labelled experiments, pairwise Pearson correlations (`--correlate`), robust median/MAD + IQR outlier diagnostics (`--outliers`), and label quality audits (`--check-labels`).
 
 ## Back up an active collection
 

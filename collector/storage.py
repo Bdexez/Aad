@@ -278,6 +278,21 @@ class Storage:
         )
         return cur.fetchall()
 
+    def update_label_notes(self, label_id: int, notes: str) -> bool:
+        if label_id <= 0:
+            raise ValueError("l'identifiant du label doit être > 0")
+        cur = self.conn.execute(
+            "UPDATE labels SET notes = ? WHERE id = ?",
+            (notes, label_id),
+        )
+        return cur.rowcount > 0
+
+    def delete_label(self, label_id: int) -> bool:
+        if label_id <= 0:
+            raise ValueError("l'identifiant du label doit être > 0")
+        cur = self.conn.execute("DELETE FROM labels WHERE id = ?", (label_id,))
+        return cur.rowcount > 0
+
     def count_samples(self) -> int:
         return int(self.conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0])
 

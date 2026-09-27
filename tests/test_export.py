@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from collector.export import export_csv, export_events, export_jsonl
+from collector.export import export_csv, export_downsampled, export_events, export_jsonl
 from collector.main import SCHEMA
 from collector.storage import Storage
 
@@ -174,3 +174,23 @@ class ExportTest(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["kind"], "gpu_reset")
         self.assertEqual(records[0]["ts"], 100)
+
+    def test_export_downsampled_aggregates_numeric_columns_per_bucket_and_boot(self):
+        self.storage.insert_samples([
+            {"ts": 1000, "boot_id": "a", "temperature": 40.0, "note": "x"},
+            {"ts": 1500, "boot_id": "a", "temperature": 50.0, "note": "y"},
+            {"ts": 2200, "boot_id": "a", "temperature": 70.0},
+            {"ts": 1200, "boot_id": "b", "temperature": 30.0},
+        ])
+        out = io.StringIO()
+        self.assertEqual(export_downsampled(self.db, out, bucket_ms=1000, fmt="jsonl"), 3)
+        records = [json.loads(line) for line in out.getvalue().splitlines()]
+        self.assertEqual(records, [
+            {"bucket_ts": 1000, "boot_id": "a", "sample_count": 2, "temperature": 45.0},
+            {"bucket_ts": 1000, "boot_id": "b", "sample_count": 1, "temperature": 30.0},
+            {"bucket_ts": 2000, "boot_id": "a", "sample_count": 1, "temperature": 70.0},
+        ])
+        with self.assertRaises(ValueError):
+            export_downsampled(self.db, io.StringIO(), bucket_ms=0)
+        with self.assertRaises(ValueError):
+            export_downsampled(self.db, io.StringIO(), bucket_ms=1000, columns=["note"])

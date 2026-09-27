@@ -100,7 +100,11 @@ class ExportCliTest(unittest.TestCase):
         self.assertEqual(ev_records[0]["source"], "kmsg")
         self.assertIn("1 événement(s)", ev_status)
 
-        for bad in (("--events", "--boot", "a"), ("--source", "kmsg")):
+        for bad in (("--events", "--boot", "a"), ("--events", "--bucket-ms", "1000"), ("--source", "kmsg")):
             with self.subTest(bad=bad), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as err:
                 export_module.main(["--db", str(self.db), *bad])
             self.assertEqual(err.exception.code, 2)
+
+        ds_out, ds_status = self.cli("--bucket-ms", "100", "--format", "jsonl")
+        self.assertEqual(len(ds_out.splitlines()), 2)
+        self.assertIn("2 fenêtre(s)", ds_status)

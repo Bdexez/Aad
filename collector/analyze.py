@@ -611,6 +611,81 @@ def audit_labels(
     }
 
 
+def analyze_drift(
+    db: str | pathlib.Path,
+    *,
+    boot_id: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+    slices: int = 2,
+) -> dict:
+    """Mesure la dérive entre la première et la dernière tranche temporelle.
+
+    Découpe l'étendue observée [min_ts, max_ts] en `slices` tranches de durée
+    égale et compare les statistiques SQLite de la première et de la dernière
+    tranche (útil pour repérer un encrassement ou un échauffement progressif).
+    """
+    if slices < 2:
+        raise ValueError("--slices doit être >= 2")
+    validate_time_range(since, until)
+    where, params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
+    with read_snapshot(db) as conn:
+        metrics, _ = _numeric_metrics(conn)
+        total, min_ts, max_ts = conn.execute(
+            "SELECT COUNT(*), MIN(s.ts), MAX(s.ts) FROM samples AS s" + where, params
+        ).fetchone()
+        if not total or min_ts is None or max_ts is None or max_ts <= min_ts:
+            return {
+                "boot_id": boot_id,
+                "window": {"since": since, "until": until},
+                "slices": slices,
+                "first_slice": {"since": min_ts, "until": min_ts, "samples": 0},
+                "last_slice": {"since": max_ts, "until": max_ts, "samples": 0},
+                "metrics": [],
+            }
+        span = max_ts - min_ts + 1
+        width = max(1, span // slices)
+        first_until = min_ts + width
+        last_since = max_ts + 1 - width
+        last_until = max_ts + 1
+
+        f_where, f_params = sample_filter_sql(boot_id=boot_id, since=min_ts, until=first_until, alias="s")
+        l_where, l_params = sample_filter_sql(boot_id=boot_id, since=last_since, until=last_until, alias="s")
+        first_count = conn.execute("SELECT COUNT(*) FROM samples AS s" + f_where, f_params).fetchone()[0]
+        last_count = conn.execute("SELECT COUNT(*) FROM samples AS s" + l_where, l_params).fetchone()[0]
+        first_stats = _compute_numeric_stats(conn, metrics, first_count, f_where, f_params)
+        last_stats = _compute_numeric_stats(conn, metrics, last_count, l_where, l_params)
+
+    drifts = []
+    for first, last in zip(first_stats, last_stats):
+        f_mean, f_std = first["mean"], first["std"]
+        l_mean, l_std = last["mean"], last["std"]
+        delta = None if f_mean is None or l_mean is None else l_mean - f_mean
+        z_drift = None if delta is None or f_std is None or f_std == 0.0 else delta / f_std
+        drifts.append({
+            "column": first["column"],
+            "first_present": first["present"],
+            "first_mean": f_mean,
+            "first_std": f_std,
+            "last_present": last["present"],
+            "last_mean": l_mean,
+            "last_std": l_std,
+            "delta_mean": delta,
+            "z_drift": z_drift,
+        })
+    drifts.sort(
+        key=lambda item: (item["z_drift"] is None, -(abs(item["z_drift"]) if item["z_drift"] is not None else 0.0), item["column"])
+    )
+    return {
+        "boot_id": boot_id,
+        "window": {"since": since, "until": until},
+        "slices": slices,
+        "first_slice": {"since": min_ts, "until": first_until, "samples": first_count},
+        "last_slice": {"since": last_since, "until": last_until, "samples": last_count},
+        "metrics": drifts,
+    }
+
+
 def _fmt(value: float | None, digits: int = 2) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
 
@@ -627,6 +702,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="paires minimales pour calculer une corrélation (défaut : 3)")
     parser.add_argument("--z-threshold", type=float, default=3.5,
                         help="seuil de z-score modifié (MAD) pour --outliers (défaut : 3.5)")
+    parser.add_argument("--slices", type=int, default=2,
+                        help="nombre de tranches temporelles pour --drift (défaut : 2)")
     parser.add_argument("--columns", nargs="+", help="sous-ensemble de métriques (pour --outliers)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--compare", nargs=2, metavar=("BASELINE", "TARGET"),
@@ -637,6 +714,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                       help="détecter les valeurs atypiques par médiane/MAD et IQR")
     mode.add_argument("--check-labels", action="store_true",
                       help="auditer les fenêtres d'annotations (vides, ouvertes, chevauchements)")
+    mode.add_argument("--drift", action="store_true",
+                      help="mesurer la dérive entre la première et la dernière tranche temporelle")
     parser.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
     args = parser.parse_args(argv)
 
@@ -661,6 +740,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             result = audit_labels(
                 args.db, boot_id=args.boot_id, since=args.since, until=args.until,
             )
+        elif args.drift:
+            result = analyze_drift(
+                args.db, boot_id=args.boot_id, since=args.since, until=args.until,
+                slices=args.slices,
+            )
         else:
             result = analyze_dataset(
                 args.db, boot_id=args.boot_id, since=args.since,
@@ -671,6 +755,17 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.drift:
+        f, l = result["first_slice"], result["last_slice"]
+        print(f"Dérive temporelle ({result['slices']} tranches : {f['samples']} → {l['samples']} mesures) :")
+        for item in result["metrics"]:
+            print(
+                f"  {item['column']} : {_fmt(item['first_mean'])} ± {_fmt(item['first_std'])}"
+                f" → {_fmt(item['last_mean'])} ± {_fmt(item['last_std'])}"
+                f" (Δ={_fmt(item['delta_mean'])}, z={_fmt(item['z_drift'])})"
+            )
         return
 
     if args.check_labels:

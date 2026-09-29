@@ -309,6 +309,24 @@ database:
 - **Label quality audit (`--check-labels`)**: lists empty windows, open windows,
   windows with zero matching samples, window overlaps (distinguishing same-label
   from cross-label overlaps) and multi-label sample counts.
+- **Temporal drift (`--drift`)**: splits the observed time span into `--slices`
+  equal windows (default 2) and ranks numeric metrics by standardized shift
+  between the first and last slices.
+
+### Baseline anomaly detector
+
+```bash
+python -m collector.detector --db data/metrics.db --baseline-label normal --since 1794300000000
+python -m collector.detector --db data/metrics.db --baseline-label normal --eval-label airflow_blocked --json
+```
+
+`collector.detector` fits a per-metric robust reference (`median` / `MAD`,
+falling back to `mean` / `std`, skipping constant sensors) on a baseline label
+or time/boot window, streams target samples from a read-only snapshot, and
+groups consecutive excursions (`max |z| >= --threshold` for at least
+`--min-samples` ticks) into episodes annotated with their top contributing
+sensors. Passing `--eval-label` computes sample-level `tp`, `fp`, `fn`, `tn`,
+`precision`, `recall` and `f1`.
 
 ### Backing up during collection
 

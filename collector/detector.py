@@ -125,6 +125,7 @@ def detect_anomalies(
     threshold: float = 4.0,
     min_samples: int = 3,
     top_contributors: int = 3,
+    event_margin_ms: int = 5000,
 ) -> dict:
     """Ajuste une référence robuste et détecte les épisodes anormaux sur la cible."""
     if not math.isfinite(threshold) or threshold <= 0:
@@ -133,6 +134,8 @@ def detect_anomalies(
         raise ValueError("--min-samples doit être >= 1")
     if top_contributors < 1:
         raise ValueError("top_contributors doit être >= 1")
+    if event_margin_ms < 0:
+        raise ValueError("--event-margin-ms doit être >= 0")
     validate_time_range(baseline_since, baseline_until)
     validate_time_range(since, until)
     if baseline_label is not None:
@@ -299,6 +302,23 @@ def detect_anomalies(
 
         flush_run()
 
+        has_events = bool(
+            conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'").fetchone()
+        )
+        for ep in episodes:
+            if has_events:
+                ev_rows = conn.execute(
+                    "SELECT ts, source, kind, severity, message FROM events"
+                    " WHERE ts >= ? AND ts <= ? ORDER BY ts, id",
+                    (ep["ts_start"] - event_margin_ms, ep["ts_end"] + event_margin_ms),
+                ).fetchall()
+                ep["events"] = [
+                    {"ts": r[0], "source": r[1], "kind": r[2], "severity": r[3], "message": r[4]}
+                    for r in ev_rows
+                ]
+            else:
+                ep["events"] = []
+
     result = {
         "baseline": {
             "label": baseline_label,
@@ -347,6 +367,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="seuil de z-score absolu (défaut : 4.0)")
     parser.add_argument("--min-samples", type=int, default=3,
                         help="longueur minimale d'un épisode anormal (défaut : 3)")
+    parser.add_argument("--event-margin-ms", type=int, default=5000,
+                        help="marge (ms) pour associer les événements autour d'un épisode (défaut : 5000)")
     parser.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
     args = parser.parse_args(argv)
 
@@ -370,6 +392,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             columns=args.columns,
             threshold=args.threshold,
             min_samples=args.min_samples,
+            event_margin_ms=args.event_margin_ms,
         )
     except (ValueError, OSError, sqlite3.Error) as exc:
         parser.error(str(exc))
@@ -393,6 +416,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             f"  #{idx} boot={ep['boot_id']} [{ep['ts_start']}..{ep['ts_end']}] "
             f"n={ep['sample_count']} pic={ep['peak_score']:.1f} — {contribs}"
         )
+        if ep["events"]:
+            kinds = ", ".join(sorted({f"{e['source']}/{e['kind']}" for e in ep["events"]}))
+            print(f"       événements proches ({len(ep['events'])}) : {kinds}")
     if "evaluation" in result:
         ev = result["evaluation"]
         fmt = lambda v: "n/a" if v is None else f"{v:.3f}"

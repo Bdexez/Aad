@@ -5,12 +5,45 @@ from __future__ import annotations
 import argparse
 from collections.abc import Sequence
 from contextlib import closing
+import json
 import math
 import pathlib
 import sqlite3
 import time
 
 from .database import read_snapshot
+
+_EXPECTED_TABLES = ("samples", "boots", "events", "labels")
+
+
+def verify_database(db: str | pathlib.Path) -> dict:
+    """Vérifie l'intégrité et le schéma d'une base SQLite en lecture seule."""
+    path = pathlib.Path(db)
+    with read_snapshot(path) as conn:
+        quick_check = conn.execute("PRAGMA quick_check").fetchone()[0]
+        if quick_check != "ok":
+            raise sqlite3.DatabaseError(f"quick_check a échoué: {quick_check}")
+        existing = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        missing = [table for table in _EXPECTED_TABLES if table not in existing]
+        if "samples" in missing:
+            raise ValueError("la base ne contient pas de table samples")
+        counts = {
+            table: int(conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+            for table in _EXPECTED_TABLES
+            if table in existing
+        }
+        journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    return {
+        "path": str(path),
+        "quick_check": quick_check,
+        "journal_mode": journal_mode,
+        "missing_tables": missing,
+        "counts": counts,
+        "ok": quick_check == "ok" and not missing,
+    }
 
 
 def backup_database(
@@ -53,15 +86,31 @@ def backup_database(
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Sauvegarder une base AAD pendant la collecte")
+    parser = argparse.ArgumentParser(description="Sauvegarder ou vérifier une base AAD")
     parser.add_argument("--db", default="data/metrics.db", help="base SQLite existante")
-    parser.add_argument("--output", required=True, type=pathlib.Path, help="nouveau fichier de sauvegarde")
+    parser.add_argument("--output", type=pathlib.Path, help="nouveau fichier de sauvegarde")
+    parser.add_argument("--verify", action="store_true", help="vérifier l'intégrité d'une base en lecture seule")
+    parser.add_argument("--json", action="store_true", help="sortie JSON (avec --verify)")
     parser.add_argument("--timeout", type=float, default=30.0, help="délai de copie en secondes (défaut : 30)")
     args = parser.parse_args(argv)
+    if args.verify and args.output is not None:
+        parser.error("--verify et --output sont mutuellement exclusifs")
+    if args.json and not args.verify:
+        parser.error("--json nécessite --verify")
+    if not args.verify and args.output is None:
+        parser.error("--output est requis (ou utilisez --verify)")
     try:
+        if args.verify:
+            result = verify_database(args.db)
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                counts = ", ".join(f"{k}={v}" for k, v in result["counts"].items())
+                print(f"base valide ({result['journal_mode']}) : {counts}")
+            return
         destination = backup_database(args.db, args.output, timeout=args.timeout)
     except (ValueError, OSError, sqlite3.Error) as exc:
-        parser.error(f"sauvegarde impossible: {exc}")
+        parser.error(f"opération impossible: {exc}")
     print(f"sauvegarde créée : {destination}")
 
 

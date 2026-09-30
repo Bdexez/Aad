@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
 import io
+import json
 import pathlib
 import sqlite3
 import tempfile
@@ -65,3 +66,21 @@ class BackupCliTest(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 self.cli()
         self.assertFalse(self.output.exists())
+
+    def test_verify_validates_database_read_only_in_text_and_json_modes(self):
+        before = self.db.read_bytes()
+        with redirect_stdout(io.StringIO()) as out:
+            backup_module.main(["--db", str(self.db), "--verify", "--json"])
+        payload = json.loads(out.getvalue())
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["counts"]["samples"], 1)
+        self.assertEqual(payload["missing_tables"], [])
+        self.assertEqual(self.db.read_bytes(), before)
+
+        with redirect_stdout(io.StringIO()) as out:
+            backup_module.main(["--db", str(self.db), "--verify"])
+        self.assertIn("base valide", out.getvalue())
+
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as err:
+            backup_module.main(["--db", str(self.db), "--verify", "--output", str(self.output)])
+        self.assertEqual(err.exception.code, 2)

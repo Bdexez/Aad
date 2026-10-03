@@ -317,7 +317,8 @@ database:
 
 ```bash
 python -m collector.detector --db data/metrics.db --baseline-label normal --since 1794300000000
-python -m collector.detector --db data/metrics.db --baseline-label normal --eval-label airflow_blocked --json
+python -m collector.detector --db data/metrics.db --baseline-label normal --control-for cpu_util --save-model baseline.json
+python -m collector.detector --db data/metrics.db --load-model baseline.json --eval-label airflow_blocked --json
 ```
 
 `collector.detector` fits a per-metric robust reference (`median` / `MAD`,
@@ -325,8 +326,12 @@ falling back to `mean` / `std`, skipping constant sensors) on a baseline label
 or time/boot window, streams target samples from a read-only snapshot, and
 groups consecutive excursions (`max |z| >= --threshold` for at least
 `--min-samples` ticks) into episodes annotated with their top contributing
-sensors. Passing `--eval-label` computes sample-level `tp`, `fp`, `fn`, `tn`,
-`precision`, `recall` and `f1`.
+sensors and nearby `events` within `--event-margin-ms` (default 5000 ms).
+Passing `--control-for COLUMN` fits a linear baseline per sensor against the
+selected workload/context metric and scores residuals instead of raw values.
+Models can be saved and reused via `--save-model` / `--load-model`. Passing
+`--eval-label` computes sample-level `tp`, `fp`, `fn`, `tn`, `precision`,
+`recall` and `f1`.
 
 ### Backing up during collection
 

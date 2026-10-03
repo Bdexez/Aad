@@ -98,15 +98,17 @@ Score a target window against a reference baseline and evaluate against ground-t
 
 ```bash
 python -m collector.detector --db data/metrics.db --baseline-label normal --since 1794300000000
-python -m collector.detector --db data/metrics.db --baseline-label normal --eval-label airflow_blocked --json
+python -m collector.detector --db data/metrics.db --baseline-label normal --control-for cpu_util --save-model baseline.json
+python -m collector.detector --db data/metrics.db --load-model baseline.json --eval-label airflow_blocked --json
 ```
 
-The detector fits a robust per-metric baseline (median/MAD with sample-std fallback, skipping constant sensors), streams target samples from a read-only snapshot, groups consecutive excursions (`--threshold`, `--min-samples`) into episodes with top contributing sensors, and optionally reports precision/recall/F1 against `--eval-label`.
+The detector fits a robust per-metric baseline (median/MAD with sample-std fallback, skipping constant sensors), optionally conditioned on a workload/context metric (`--control-for`) via linear-regression residuals so high temperatures under heavy load remain normal while elevated temperatures at idle are flagged. It streams target samples from a read-only snapshot, groups consecutive excursions (`--threshold`, `--min-samples`) into episodes annotated with top contributing sensors and nearby kernel/hardware events (`--event-margin-ms`), supports JSON model persistence (`--save-model`/`--load-model`), and optionally reports precision/recall/F1 against `--eval-label`.
 
 ## Back up an active collection
 
 ```bash
 python -m collector.backup --db data/metrics.db --output data/metrics-backup.db
+python -m collector.backup --db data/metrics-backup.db --verify --json
 ```
 
 The SQLite backup includes committed WAL transactions while collection continues, checks the copy and produces a standalone database file. It refuses to overwrite existing files. `--timeout` limits copying (30 seconds by default); pending samples still buffered in RAM are included only after the collector flushes them.

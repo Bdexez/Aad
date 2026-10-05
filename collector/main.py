@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from collections.abc import Sequence
 import json
 import logging
 import math
@@ -521,7 +522,7 @@ def run_scan(top: int = 6, *, as_json: bool = False) -> None:
           + ("Rien de bloquant." if not result["criticals"] else "À examiner avant de collecter."))
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="AAD — collecte de télémétrie matérielle")
     ap.add_argument("--db", default="data/metrics.db")
     ap.add_argument("--period", type=float, default=1.0, help="secondes entre deux samples")
@@ -534,7 +535,7 @@ def main() -> None:
     ap.add_argument("--json", action="store_true",
                     help="sortie JSON (avec --doctor ou --scan)")
     ap.add_argument("-v", "--verbose", action="store_true")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,

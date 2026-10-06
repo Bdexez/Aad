@@ -75,6 +75,9 @@ class BackupCliTest(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["counts"]["samples"], 1)
         self.assertEqual(payload["missing_tables"], [])
+        self.assertGreater(payload["size"]["db_bytes"], 0)
+        self.assertEqual(payload["size"]["total_bytes"], payload["size"]["db_bytes"] + payload["size"]["wal_bytes"] + payload["size"]["shm_bytes"])
+        self.assertGreater(payload["size"]["bytes_per_sample"], 0)
         self.assertEqual(self.db.read_bytes(), before)
 
         with redirect_stdout(io.StringIO()) as out:

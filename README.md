@@ -26,9 +26,10 @@ AAD collects Linux hardware telemetry, workload context and fault events into a 
 From the repository root, using Python 3.10 or later:
 
 ```bash
-python -m collector.main --doctor
-python -m collector.main --scan
-python -m collector.main --db data/metrics.db --period 1.0
+python -m collector --help
+python -m collector doctor
+python -m collector scan
+python -m collector run --db data/metrics.db --period 1.0
 ```
 
 `--doctor` describes the sources this machine exposes. `--scan` classifies errors from the current boot without starting continuous database collection. Reader availability depends on the hardware, drivers and permissions; RAPL energy readings may require elevated access.
@@ -100,9 +101,18 @@ Score a target window against a reference baseline and evaluate against ground-t
 python -m collector.detector --db data/metrics.db --baseline-label normal --since 1794300000000
 python -m collector.detector --db data/metrics.db --baseline-label normal --control-for cpu_util --save-model baseline.json
 python -m collector.detector --db data/metrics.db --load-model baseline.json --eval-label airflow_blocked --json
+python -m collector.detector --db data/metrics.db --baseline-label normal --eval-label airflow_blocked --tune-threshold
 ```
 
-The detector fits a robust per-metric baseline (median/MAD with sample-std fallback, skipping constant sensors), optionally conditioned on a workload/context metric (`--control-for`) via linear-regression residuals so high temperatures under heavy load remain normal while elevated temperatures at idle are flagged. It streams target samples from a read-only snapshot, groups consecutive excursions (`--threshold`, `--min-samples`) into episodes annotated with top contributing sensors and nearby kernel/hardware events (`--event-margin-ms`), supports JSON model persistence (`--save-model`/`--load-model`), and optionally reports precision/recall/F1 against `--eval-label`.
+The detector fits a robust per-metric baseline (median/MAD with sample-std fallback, skipping constant sensors), optionally conditioned on a workload/context metric (`--control-for`) via linear-regression residuals so high temperatures under heavy load remain normal while elevated temperatures at idle are flagged. It streams target samples from a read-only snapshot, groups consecutive excursions (`--threshold`, `--min-samples`) into episodes annotated with top contributing sensors and nearby kernel/hardware events (`--event-margin-ms`), supports JSON model persistence (`--save-model`/`--load-model`), reports precision/recall/F1 against `--eval-label`, and calibrates optimal thresholds via `--tune-threshold`.
+
+## Feature engineering export
+
+Export ML-ready CSV/JSONL with per-boot streaming deltas, rates per second (`dX/dt`), rolling mean/std and decoded NVML throttle flags:
+
+```bash
+python -m collector.features --db data/metrics.db --deltas --rolling 30 --decode-throttle --output data/features.csv
+```
 
 ## Back up an active collection
 
@@ -163,12 +173,14 @@ The suite exercises fake `/proc` and `/sys` trees, sensor discovery, counter wra
 
 | Entry point | Responsibility |
 | :--- | :--- |
+| [`collector/__main__.py`](collector/__main__.py) | Unified CLI dispatcher (`python -m collector <command>`) |
 | [`collector/main.py`](collector/main.py) | Acquisition loop and reader lifecycle |
 | [`collector/readers/`](collector/readers/) | Source-specific discovery and reads |
 | [`collector/errors.py`](collector/errors.py) | Kernel fault classification rules |
 | [`collector/storage.py`](collector/storage.py) | SQLite schema evolution, batching, events and labels |
 | [`collector/label.py`](collector/label.py) | Experiment annotation CLI |
-| [`collector/export.py`](collector/export.py) | Read-only CSV export with experiment annotations |
+| [`collector/export.py`](collector/export.py) | Read-only CSV/JSONL, downsampled and events export |
+| [`collector/features.py`](collector/features.py) | Streaming ML feature engineering (deltas, rolling stats, throttle flags) |
 | [`collector/report.py`](collector/report.py) | Dataset completeness and annotation coverage |
 | [`collector/analyze.py`](collector/analyze.py) | Exploratory statistics, cadence, drift, outliers and label audits |
 | [`collector/detector.py`](collector/detector.py) | Zero-dependency explainable baseline anomaly detector |

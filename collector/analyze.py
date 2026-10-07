@@ -686,6 +686,83 @@ def analyze_drift(
     }
 
 
+def analyze_by_group(
+    db: str | pathlib.Path,
+    group_column: str,
+    *,
+    boot_id: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+    columns: Sequence[str] | None = None,
+    max_groups: int = 50,
+) -> dict:
+    """Statistiques descriptives ventilées par valeur discrète d'une colonne de contexte.
+
+    Conserve `NULL` comme groupe explicite (contexte inconnu). Rejette les
+    colonnes à trop forte cardinalité (`> max_groups`) pour éviter de grouper
+    par erreur sur une métrique continue.
+    """
+    if max_groups < 1:
+        raise ValueError("max_groups doit être >= 1")
+    validate_time_range(since, until)
+    where, params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
+    prefix = (where + " AND ") if where else " WHERE "
+    with read_snapshot(db) as conn:
+        fields = conn.execute("PRAGMA table_info(samples)").fetchall()
+        all_names = [f[1] for f in fields]
+        if group_column not in all_names:
+            raise ValueError(f"colonne de regroupement introuvable: {group_column!r}")
+        numeric_metrics = [
+            (f[1], f[2])
+            for f in fields
+            if f[1] not in _META_COLUMNS and f[1] != group_column and (f[2] or "").upper() != "TEXT"
+        ]
+        if columns is not None:
+            numeric_by_name = dict(numeric_metrics)
+            selected = list(columns)
+            if not selected:
+                raise ValueError("aucune colonne numérique sélectionnée")
+            unknown = set(selected) - set(numeric_by_name)
+            if unknown:
+                raise ValueError(f"métriques numériques introuvables: {', '.join(sorted(unknown))}")
+            metrics = [(col, numeric_by_name[col]) for col in selected]
+        else:
+            metrics = numeric_metrics
+
+        qg = quote_identifier(group_column)
+        group_rows = conn.execute(
+            f"SELECT s.{qg}, COUNT(*) FROM samples AS s{where} GROUP BY s.{qg}"
+            f" ORDER BY s.{qg} IS NULL, s.{qg}",
+            params,
+        ).fetchall()
+        if len(group_rows) > max_groups:
+            raise ValueError(
+                f"trop de groupes distincts pour {group_column!r} ({len(group_rows)} > {max_groups})"
+            )
+
+        groups = []
+        for g_val, g_count in group_rows:
+            if g_val is None:
+                g_where = f"{prefix}s.{qg} IS NULL"
+                g_params = list(params)
+            else:
+                g_where = f"{prefix}s.{qg} = ?"
+                g_params = [*params, g_val]
+            stats = _compute_numeric_stats(conn, metrics, g_count, g_where, g_params)
+            groups.append({
+                "value": g_val,
+                "samples": g_count,
+                "metrics": stats,
+            })
+
+    return {
+        "boot_id": boot_id,
+        "window": {"since": since, "until": until},
+        "group_by": group_column,
+        "groups": groups,
+    }
+
+
 def _fmt(value: float | None, digits: int = 2) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
 
@@ -716,6 +793,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                       help="auditer les fenêtres d'annotations (vides, ouvertes, chevauchements)")
     mode.add_argument("--drift", action="store_true",
                       help="mesurer la dérive entre la première et la dernière tranche temporelle")
+    mode.add_argument("--by", metavar="COLUMN",
+                      help="ventiler les statistiques numériques par valeur discrète de contexte")
     parser.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
     args = parser.parse_args(argv)
 
@@ -745,6 +824,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.db, boot_id=args.boot_id, since=args.since, until=args.until,
                 slices=args.slices,
             )
+        elif args.by:
+            result = analyze_by_group(
+                args.db, args.by, boot_id=args.boot_id, since=args.since,
+                until=args.until, columns=args.columns,
+            )
         else:
             result = analyze_dataset(
                 args.db, boot_id=args.boot_id, since=args.since,
@@ -755,6 +839,15 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.by:
+        print(f"Statistiques ventilées par {result['group_by']} :")
+        for group in result["groups"]:
+            label = "NULL" if group["value"] is None else str(group["value"])
+            print(f"  [{label}] ({group['samples']} mesure(s))")
+            for m in group["metrics"]:
+                print(f"    {m['column']} : moy={_fmt(m['mean'])}, std={_fmt(m['std'])}, min={_fmt(m['min'])}, max={_fmt(m['max'])}")
         return
 
     if args.drift:

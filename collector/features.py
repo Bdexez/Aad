@@ -66,12 +66,21 @@ def export_features(
     rolling: int | None = None,
     deltas: bool = False,
     decode_throttle: bool = False,
+    split_ratios: tuple[float, float, float] | None = None,
 ) -> int:
     """Exporte mesures + features dérivées + labels en flux depuis un snapshot lecture seule."""
     if fmt not in ("csv", "jsonl"):
         raise ValueError(f"format non supporté: {fmt!r}")
     if rolling is not None and rolling < 2:
         raise ValueError("--rolling doit être >= 2")
+    if split_ratios is not None:
+        if len(split_ratios) != 3 or any(not math.isfinite(r) or r < 0 for r in split_ratios):
+            raise ValueError("--split-ratios attend 3 nombres finis >= 0 (train val test)")
+        ratio_sum = sum(split_ratios)
+        if ratio_sum <= 0:
+            raise ValueError("la somme de --split-ratios doit être > 0")
+        norm_train = split_ratios[0] / ratio_sum
+        norm_train_val = (split_ratios[0] + split_ratios[1]) / ratio_sum
     validate_time_range(since, until)
     where, params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
 
@@ -106,6 +115,10 @@ def export_features(
         key = f"s.{quote_identifier(primary[0])}"
         projection = ", ".join(f"s.{quote_identifier(c)}" for c in query_cols)
 
+        total_for_split = 0
+        if split_ratios is not None:
+            total_for_split = conn.execute("SELECT COUNT(*) FROM samples AS s" + where, params).fetchone()[0]
+
         cursor = conn.execute(
             f"SELECT {key}, {projection}, l.id, l.ts_start, l.ts_end, l.label, l.notes"
             " FROM samples AS s LEFT JOIN labels AS l"
@@ -127,6 +140,8 @@ def export_features(
         has_throttle = decode_throttle and "gpu_throttle_mask" in selected_metrics
         if has_throttle:
             out_cols.extend(name for name, _ in THROTTLE_FLAGS)
+        if split_ratios is not None:
+            out_cols.append("split")
 
         label_col = "labels_json" if fmt == "csv" else "labels"
         writer = csv.writer(target, lineterminator="\n") if fmt == "csv" else None
@@ -143,7 +158,7 @@ def export_features(
         prev_vals: dict[str, float | None] = {}
         windows: dict[str, deque[float | None]] = {}
 
-        def emit_sample(values: tuple, labels: list[dict]) -> None:
+        def emit_sample(index: int, values: tuple, labels: list[dict]) -> None:
             nonlocal current_boot, prev_ts, prev_vals, windows
             boot = values[idx_boot]
             ts = values[idx_ts]
@@ -180,6 +195,14 @@ def export_features(
             if has_throttle:
                 decoded = decode_throttle_mask(throttle_val)
                 row_out.extend(decoded[name] for name, _ in THROTTLE_FLAGS)
+            if split_ratios is not None:
+                frac = index / total_for_split if total_for_split else 0.0
+                if frac < norm_train:
+                    row_out.append("train")
+                elif frac < norm_train_val:
+                    row_out.append("val")
+                else:
+                    row_out.append("test")
             prev_ts = ts
 
             if writer is not None:
@@ -197,7 +220,7 @@ def export_features(
         for row in cursor:
             if row[0] != previous_pk:
                 if previous_pk is not None:
-                    emit_sample(sample_values, sample_labels)
+                    emit_sample(count, sample_values, sample_labels)
                     count += 1
                 previous_pk = row[0]
                 sample_values = row[1:width]
@@ -209,7 +232,7 @@ def export_features(
                     "ts_start": start, "ts_end": end,
                 })
         if previous_pk is not None:
-            emit_sample(sample_values, sample_labels)
+            emit_sample(count, sample_values, sample_labels)
             count += 1
         return count
 
@@ -229,6 +252,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--deltas", action="store_true", help="ajouter delta et vitesse par seconde")
     parser.add_argument("--decode-throttle", action="store_true",
                         help="décomposer gpu_throttle_mask en flags binaires NVML")
+    parser.add_argument("--split-ratios", nargs=3, type=float, metavar=("TRAIN", "VAL", "TEST"),
+                        help="ajouter une colonne chronologique split (train/val/test) sans fuite")
     args = parser.parse_args(argv)
     try:
         with _output(args.output) as target:
@@ -237,6 +262,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 since=args.since, until=args.until, columns=args.columns,
                 rolling=args.rolling, deltas=args.deltas,
                 decode_throttle=args.decode_throttle,
+                split_ratios=tuple(args.split_ratios) if args.split_ratios else None,
             )
             target.flush()
     except (ValueError, OSError, sqlite3.Error) as exc:

@@ -534,6 +534,40 @@ def detect_anomalies(
             else:
                 ep["events"] = []
 
+        episode_eval = None
+        if eval_label is not None:
+            gt_rows = conn.execute(
+                "SELECT id, ts_start, ts_end FROM labels WHERE label = ?"
+                " AND (ts_end IS NULL OR ts_start < ts_end) ORDER BY ts_start, id",
+                (eval_label,),
+            ).fetchall()
+            matched_gt: set[int] = set()
+            matched_ep = 0
+            for ep in episodes:
+                hit = False
+                for gt_id, gt_start, gt_end in gt_rows:
+                    if gt_start <= ep["ts_end"] and (gt_end is None or ep["ts_start"] < gt_end):
+                        matched_gt.add(gt_id)
+                        hit = True
+                if hit:
+                    matched_ep += 1
+            ep_prec = matched_ep / len(episodes) if episodes else None
+            ep_rec = len(matched_gt) / len(gt_rows) if gt_rows else None
+            ep_f1 = (
+                2 * ep_prec * ep_rec / (ep_prec + ep_rec)
+                if ep_prec is not None and ep_rec is not None and (ep_prec + ep_rec) > 0
+                else None
+            )
+            episode_eval = {
+                "gt_windows": len(gt_rows),
+                "detected_episodes": len(episodes),
+                "matched_gt_windows": len(matched_gt),
+                "matched_episodes": matched_ep,
+                "episode_precision": ep_prec,
+                "episode_recall": ep_rec,
+                "episode_f1": ep_f1,
+            }
+
     result = {
         "baseline": baseline_meta,
         "target": {
@@ -552,6 +586,7 @@ def detect_anomalies(
         result["evaluation"] = {
             "label": eval_label,
             **_f1_metrics(tp, fp, fn, tn),
+            **(episode_eval or {}),
         }
     return result
 
@@ -617,6 +652,7 @@ def tune_threshold(
     target_label: str | None = None,
     columns: Sequence[str] | None = None,
     control_for: str | None = None,
+    group_by: str | None = None,
     thresholds: Sequence[float] | None = None,
     min_samples: int = 3,
     load_model: str | pathlib.Path | None = None,
@@ -643,6 +679,7 @@ def tune_threshold(
     with read_snapshot(db) as conn:
         metrics, order_col = _numeric_metrics(conn)
         numeric_names = [name for name, _ in metrics]
+        all_cols = {f[1] for f in conn.execute("PRAGMA table_info(samples)").fetchall()}
         if columns is not None:
             selected = list(columns)
             if not selected or (set(selected) - set(numeric_names)):
@@ -650,41 +687,78 @@ def tune_threshold(
         else:
             selected = numeric_names
 
+        grouped_fitted: dict[str, dict[str, FeatureBaseline]] = {}
         if load_model is not None:
-            loaded_meta, loaded_features, _ = load_baseline_model(load_model)
+            loaded_meta, loaded_features, loaded_grouped = load_baseline_model(load_model)
             control_for = loaded_meta.get("control_for")
+            group_by = loaded_meta.get("group_by")
             if control_for is not None and control_for not in numeric_names:
                 raise ValueError(f"colonne de contrôle du modèle absente: {control_for!r}")
+            if group_by is not None and group_by not in all_cols:
+                raise ValueError(f"colonne de régime du modèle absente: {group_by!r}")
             selected_set = set(selected)
             fitted = [fb for fb in loaded_features if fb.column in selected_set]
             if not fitted:
                 raise ValueError("aucune métrique du modèle n'est présente dans la base cible")
+            for g_key, g_feats in loaded_grouped.items():
+                grouped_fitted[g_key] = {fb.column: fb for fb in g_feats if fb.column in selected_set}
         else:
             if control_for is not None and control_for not in numeric_names:
                 raise ValueError(f"colonne de contrôle introuvable: {control_for!r}")
-            _, fitted, _ = _fit_baseline(conn, selected, base_where, base_params, control_for=control_for)
+            if group_by is not None and group_by not in all_cols:
+                raise ValueError(f"colonne de régime introuvable: {group_by!r}")
+            fit_cols = [c for c in selected if c != group_by]
+            _, fitted, _ = _fit_baseline(conn, fit_cols, base_where, base_params, control_for=control_for)
+            if group_by is not None:
+                qg = quote_identifier(group_by)
+                g_prefix = (base_where + " AND ") if base_where else " WHERE "
+                g_vals = [
+                    r[0]
+                    for r in conn.execute(
+                        f"SELECT DISTINCT s.{qg} FROM samples AS s{g_prefix}s.{qg} IS NOT NULL",
+                        base_params,
+                    )
+                ]
+                for g_val in g_vals:
+                    try:
+                        _, gf, _ = _fit_baseline(
+                            conn, fit_cols, f"{g_prefix}s.{qg} = ?", [*base_params, g_val], control_for=control_for,
+                        )
+                    except ValueError:
+                        continue
+                    grouped_fitted[str(g_val)] = {fb.column: fb for fb in gf}
 
         projection = ", ".join(f"s.{quote_identifier(fb.column)}" for fb in fitted)
         control_select = f", s.{quote_identifier(control_for)}" if control_for is not None else ""
+        group_select = f", s.{quote_identifier(group_by)}" if group_by is not None else ""
         clause, e_params = _label_exists_clause(eval_label)
         cursor = conn.execute(
-            f"SELECT s.boot_id, {projection}{control_select}, ({clause})"
+            f"SELECT s.boot_id, {projection}{control_select}{group_select}, ({clause})"
             f" FROM samples AS s{target_where}"
             f" ORDER BY s.boot_id, s.{quote_identifier(order_col)}",
             [*e_params, *target_params],
         )
         n_feat = len(fitted)
         has_control = control_for is not None
+        has_group = group_by is not None
         scored: list[tuple[str, float | None, bool]] = []
         for row in cursor:
             boot = row[0]
             values = row[1 : 1 + n_feat]
-            ctrl_val = row[1 + n_feat] if has_control else None
-            is_pos = bool(row[1 + n_feat + (1 if has_control else 0)])
+            idx = 1 + n_feat
+            ctrl_val = row[idx] if has_control else None
+            if has_control:
+                idx += 1
+            grp_val = row[idx] if has_group else None
+            if has_group:
+                idx += 1
+            is_pos = bool(row[idx])
+            active_group = grouped_fitted.get(str(grp_val)) if (has_group and grp_val is not None) else None
             max_abs: float | None = None
-            for fb, val in zip(fitted, values):
+            for base_fb, val in zip(fitted, values):
                 if val is None:
                     continue
+                fb = active_group.get(base_fb.column, base_fb) if active_group is not None else base_fb
                 if fb.intercept is not None:
                     if ctrl_val is None:
                         continue
@@ -771,6 +845,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 target_label=args.target_label,
                 columns=args.columns,
                 control_for=args.control_for,
+                group_by=args.group_by,
                 thresholds=args.thresholds,
                 min_samples=args.min_samples,
                 load_model=args.load_model,

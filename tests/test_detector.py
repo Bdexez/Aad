@@ -271,6 +271,15 @@ class BaselineDetectorTest(unittest.TestCase):
             threshold=4.0, min_samples=3,
         )
         self.assertAlmostEqual(reloaded["evaluation"]["f1"], 1.0)
+        self.assertAlmostEqual(reloaded["evaluation"]["episode_f1"], 1.0)
+        self.assertEqual(reloaded["evaluation"]["matched_gt_windows"], 1)
+
+        tuned = tune_threshold(
+            self.db, load_model=model_path, since=10000, eval_label="idle_hot",
+            thresholds=[2.0, 4.0, 40.0], min_samples=3,
+        )
+        self.assertEqual(tuned["best"]["threshold"], 4.0)
+        self.assertAlmostEqual(tuned["best"]["f1"], 1.0)
 
 
 if __name__ == "__main__":

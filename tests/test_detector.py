@@ -230,6 +230,48 @@ class BaselineDetectorTest(unittest.TestCase):
             detector_module.main(["--db", str(self.db), "--baseline-label", "normal", "--tune-threshold"])
         self.assertEqual(exc.exception.code, 2)
 
+    def test_group_by_fits_separate_regime_baselines_and_persists_in_model(self):
+        self.storage.ensure_columns(["is_gaming"])
+        # Référence : repos (is_gaming=0) ≈ 45°C ± 1, jeu (is_gaming=1) ≈ 75°C ± 1
+        rows = [
+            {"ts": 1000, "boot_id": "a", "is_gaming": 0.0, "temp_c": 44.0},
+            {"ts": 2000, "boot_id": "a", "is_gaming": 0.0, "temp_c": 45.0},
+            {"ts": 3000, "boot_id": "a", "is_gaming": 0.0, "temp_c": 46.0},
+            {"ts": 4000, "boot_id": "a", "is_gaming": 0.0, "temp_c": 45.0},
+            {"ts": 5000, "boot_id": "a", "is_gaming": 1.0, "temp_c": 74.0},
+            {"ts": 6000, "boot_id": "a", "is_gaming": 1.0, "temp_c": 75.0},
+            {"ts": 7000, "boot_id": "a", "is_gaming": 1.0, "temp_c": 76.0},
+            {"ts": 8000, "boot_id": "a", "is_gaming": 1.0, "temp_c": 75.0},
+            # Cible : 3 ticks à 75°C EN JEU (normal) puis 3 ticks à 75°C AU REPOS (anomalie)
+            {"ts": 10000, "boot_id": "a", "is_gaming": 1.0, "temp_c": 75.5},
+            {"ts": 11000, "boot_id": "a", "is_gaming": 1.0, "temp_c": 74.5},
+            {"ts": 12000, "boot_id": "a", "is_gaming": 1.0, "temp_c": 75.0},
+            {"ts": 13000, "boot_id": "a", "is_gaming": 0.0, "temp_c": 75.0},
+            {"ts": 14000, "boot_id": "a", "is_gaming": 0.0, "temp_c": 76.0},
+            {"ts": 15000, "boot_id": "a", "is_gaming": 0.0, "temp_c": 74.0},
+        ]
+        self.storage.insert_samples(rows)
+        norm = self.storage.start_label(1000, "normal")
+        self.storage.end_label(9000, norm)
+        anom = self.storage.start_label(13000, "idle_hot")
+        self.storage.end_label(16000, anom)
+
+        model_path = self.db.with_name("regime_model.json")
+        res = detect_anomalies(
+            self.db, baseline_label="normal", since=10000, columns=["temp_c"],
+            group_by="is_gaming", eval_label="idle_hot", threshold=4.0, min_samples=3,
+            save_model=model_path,
+        )
+        self.assertEqual(len(res["episodes"]), 1)
+        self.assertEqual(res["episodes"][0]["ts_start"], 13000)
+        self.assertAlmostEqual(res["evaluation"]["f1"], 1.0)
+
+        reloaded = detect_anomalies(
+            self.db, load_model=model_path, since=10000, eval_label="idle_hot",
+            threshold=4.0, min_samples=3,
+        )
+        self.assertAlmostEqual(reloaded["evaluation"]["f1"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

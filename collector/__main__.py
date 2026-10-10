@@ -6,7 +6,17 @@ import argparse
 from collections.abc import Sequence
 import sys
 
-from . import analyze, backup, detector, export, features, label, main as collect_main, report
+from . import (
+    analyze,
+    backup,
+    detector,
+    export,
+    features,
+    html_report,
+    label,
+    main as collect_main,
+    report,
+)
 
 COMMANDS: dict[str, tuple[str, object]] = {
     "run": ("lancer la collecte continue", lambda argv: collect_main.main(argv)),
@@ -14,6 +24,7 @@ COMMANDS: dict[str, tuple[str, object]] = {
     "scan": ("classer les erreurs noyau du boot courant", lambda argv: collect_main.main(["--scan", *argv])),
     "label": ("gérer les annotations d'expériences", label.main),
     "report": ("rapport de complétude du dataset", report.main),
+    "html-report": ("générer un rapport HTML autonome avec sparklines SVG", html_report.main),
     "analyze": ("analyse exploratoire (cadence, stats, corrélations, dérive)", analyze.main),
     "detect": ("détecteur statistique d'anomalies et calibration", detector.main),
     "export": ("exporter mesures (CSV/JSONL/downsampled) ou événements", export.main),

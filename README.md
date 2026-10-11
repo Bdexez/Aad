@@ -87,7 +87,9 @@ python -m collector.analyze --db data/metrics.db --compare normal airflow_blocke
 python -m collector.analyze --db data/metrics.db --correlate k10temp_tctl
 python -m collector.analyze --db data/metrics.db --outliers --z-threshold 3.5
 python -m collector.analyze --db data/metrics.db --drift --slices 2
+python -m collector.analyze --db data/metrics.db --by is_gaming
 python -m collector.analyze --db data/metrics.db --check-labels
+python -m collector.html_report --db data/metrics.db --output data/report.html
 python -m collector.analyze --db data/metrics.db --boot BOOT_ID --json
 ```
 
@@ -99,9 +101,9 @@ Score a target window against a reference baseline and evaluate against ground-t
 
 ```bash
 python -m collector.detector --db data/metrics.db --baseline-label normal --since 1794300000000
-python -m collector.detector --db data/metrics.db --baseline-label normal --control-for cpu_util --save-model baseline.json
+python -m collector.detector --db data/metrics.db --baseline-label normal --control-for cpu_util --group-by is_gaming --save-model baseline.json
 python -m collector.detector --db data/metrics.db --load-model baseline.json --eval-label airflow_blocked --json
-python -m collector.detector --db data/metrics.db --baseline-label normal --eval-label airflow_blocked --tune-threshold
+python -m collector.detector --db data/metrics.db --baseline-label normal --group-by is_gaming --eval-label airflow_blocked --tune-threshold
 ```
 
 The detector fits a robust per-metric baseline (median/MAD with sample-std fallback, skipping constant sensors), optionally conditioned on a workload/context metric (`--control-for`) via linear-regression residuals so high temperatures under heavy load remain normal while elevated temperatures at idle are flagged. It streams target samples from a read-only snapshot, groups consecutive excursions (`--threshold`, `--min-samples`) into episodes annotated with top contributing sensors and nearby kernel/hardware events (`--event-margin-ms`), supports JSON model persistence (`--save-model`/`--load-model`), reports precision/recall/F1 against `--eval-label`, and calibrates optimal thresholds via `--tune-threshold`.
@@ -111,7 +113,7 @@ The detector fits a robust per-metric baseline (median/MAD with sample-std fallb
 Export ML-ready CSV/JSONL with per-boot streaming deltas, rates per second (`dX/dt`), rolling mean/std and decoded NVML throttle flags:
 
 ```bash
-python -m collector.features --db data/metrics.db --deltas --rolling 30 --decode-throttle --output data/features.csv
+python -m collector.features --db data/metrics.db --deltas --rolling 30 --decode-throttle --split-ratios 0.7 0.15 0.15 --output data/features.csv
 ```
 
 ## Back up an active collection
@@ -182,6 +184,7 @@ The suite exercises fake `/proc` and `/sys` trees, sensor discovery, counter wra
 | [`collector/export.py`](collector/export.py) | Read-only CSV/JSONL, downsampled and events export |
 | [`collector/features.py`](collector/features.py) | Streaming ML feature engineering (deltas, rolling stats, throttle flags) |
 | [`collector/report.py`](collector/report.py) | Dataset completeness and annotation coverage |
+| [`collector/html_report.py`](collector/html_report.py) | Standalone offline HTML campaign report with SVG sparklines |
 | [`collector/analyze.py`](collector/analyze.py) | Exploratory statistics, cadence, drift, outliers and label audits |
 | [`collector/detector.py`](collector/detector.py) | Zero-dependency explainable baseline anomaly detector |
 | [`collector/backup.py`](collector/backup.py) | Consistent backup while collection continues |

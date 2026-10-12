@@ -13,6 +13,7 @@ from collections.abc import Sequence
 import json
 import math
 import pathlib
+import re
 import sqlite3
 
 from .database import read_snapshot, sample_filter_sql, validate_time_range
@@ -763,6 +764,90 @@ def analyze_by_group(
     }
 
 
+_PHYSICAL_BOUND_RULES: tuple[tuple[re.Pattern[str], float | None, float | None, str], ...] = (
+    (re.compile(r"^(cpu|cpu\d+)_util$"), 0.0, 1.0, "ratio [0, 1]"),
+    (re.compile(r"(_pct$|^gpu_(mem_)?util$|^psi_)"), 0.0, 100.0, "% [0, 100]"),
+    (re.compile(r"(_w$|_watts$)"), 0.0, 1000.0, "W [0, 1000]"),
+    (re.compile(r"_rpm$"), 0.0, 20000.0, "RPM [0, 20000]"),
+    (re.compile(r"(_mhz$|^cpu_freq_avg$|^gpu_clock_)"), 0.0, 10000.0, "MHz [0, 10000]"),
+    (re.compile(r"_v$"), 0.0, 20.0, "V [0, 20]"),
+    (re.compile(r"(_tctl$|_tccd\d*$|^gpu_temp$|_temp\d*$|^nvme\d*_(composite|sensor)|^amdgpu_(edge|junction|mem)$)"), -20.0, 150.0, "°C [-20, 150]"),
+    (re.compile(r"(_mb$|^load1$|^uptime_s$|^n_procs$|^err_|^kmsg_)"), 0.0, None, ">= 0"),
+)
+
+
+def _physical_bounds_for(column: str) -> tuple[float | None, float | None, str] | None:
+    for pattern, lo, hi, unit in _PHYSICAL_BOUND_RULES:
+        if pattern.search(column):
+            return lo, hi, unit
+    return None
+
+
+def check_physical_bounds(
+    db: str | pathlib.Path,
+    *,
+    boot_id: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+) -> dict:
+    """Vérifie si les métriques numériques connues respectent des bornes physiques plausibles.
+
+    Calculé intégralement dans SQLite ; ne modifie aucune donnée.
+    """
+    validate_time_range(since, until)
+    where, params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
+    with read_snapshot(db) as conn:
+        metrics, _ = _numeric_metrics(conn)
+        checked: list[tuple[str, float | None, float | None, str]] = []
+        for col, _ in metrics:
+            bounds = _physical_bounds_for(col)
+            if bounds is not None:
+                checked.append((col, *bounds))
+        violations: list[dict] = []
+        if checked:
+            exprs = []
+            query_params: list[float] = []
+            for col, lo, hi, _ in checked:
+                qc = quote_identifier(col)
+                if lo is not None:
+                    exprs.append(f"COUNT(CASE WHEN {qc} < ? THEN 1 END)")
+                    query_params.append(lo)
+                else:
+                    exprs.append("0")
+                if hi is not None:
+                    exprs.append(f"COUNT(CASE WHEN {qc} > ? THEN 1 END)")
+                    query_params.append(hi)
+                else:
+                    exprs.append("0")
+                exprs.append(f"MIN({qc})")
+                exprs.append(f"MAX({qc})")
+            row = conn.execute(
+                "SELECT " + ", ".join(exprs) + " FROM samples AS s" + where,
+                [*query_params, *params],
+            ).fetchone()
+            for idx, (col, lo, hi, unit) in enumerate(checked):
+                below, above, minimum, maximum = row[idx * 4 : (idx + 1) * 4]
+                if below or above:
+                    violations.append({
+                        "column": col,
+                        "unit": unit,
+                        "expected_min": lo,
+                        "expected_max": hi,
+                        "below_min": below,
+                        "above_max": above,
+                        "observed_min": minimum,
+                        "observed_max": maximum,
+                    })
+            violations.sort(key=lambda item: (-(item["below_min"] + item["above_max"]), item["column"]))
+    return {
+        "boot_id": boot_id,
+        "window": {"since": since, "until": until},
+        "checked_metrics": len(checked),
+        "total_violations": sum(v["below_min"] + v["above_max"] for v in violations),
+        "violations": violations,
+    }
+
+
 def _fmt(value: float | None, digits: int = 2) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
 
@@ -795,6 +880,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                       help="mesurer la dérive entre la première et la dernière tranche temporelle")
     mode.add_argument("--by", metavar="COLUMN",
                       help="ventiler les statistiques numériques par valeur discrète de contexte")
+    mode.add_argument("--check-bounds", action="store_true",
+                      help="vérifier les bornes physiques plausibles des sondes connues")
     parser.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
     args = parser.parse_args(argv)
 
@@ -829,6 +916,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.db, args.by, boot_id=args.boot_id, since=args.since,
                 until=args.until, columns=args.columns,
             )
+        elif args.check_bounds:
+            result = check_physical_bounds(
+                args.db, boot_id=args.boot_id, since=args.since, until=args.until,
+            )
         else:
             result = analyze_dataset(
                 args.db, boot_id=args.boot_id, since=args.since,
@@ -839,6 +930,18 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.check_bounds:
+        print(
+            f"Contrôle des bornes physiques ({result['checked_metrics']} sonde(s) vérifiée(s), "
+            f"{result['total_violations']} violation(s)) :"
+        )
+        for v in result["violations"]:
+            print(
+                f"  {v['column']} ({v['unit']}) : <min={v['below_min']}, >max={v['above_max']} "
+                f"(observé [{_fmt(v['observed_min'])}, {_fmt(v['observed_max'])}])"
+            )
         return
 
     if args.by:

@@ -15,6 +15,7 @@ from collector.analyze import (
     analyze_dataset,
     analyze_drift,
     audit_labels,
+    check_physical_bounds,
     compare_labels,
     correlate_metric,
     detect_outliers,
@@ -333,6 +334,24 @@ class AnalyzeDatasetTest(unittest.TestCase):
             analyze_module.main(["--db", str(self.db), "--by", "is_gaming", "--columns", "temp_c"])
         self.assertIn("[0.0]", out.getvalue())
         self.assertIn("[NULL]", out.getvalue())
+
+    def test_check_physical_bounds_flags_implausible_sensor_readings(self):
+        self.storage.ensure_columns(["cpu_util", "k10temp_tctl", "rapl_pkg_watts"])
+        self.storage.insert_samples([
+            {"ts": 1000, "boot_id": "a", "cpu_util": 0.5, "k10temp_tctl": 60.0, "rapl_pkg_watts": 45.0},
+            {"ts": 2000, "boot_id": "a", "cpu_util": 1.5, "k10temp_tctl": 250.0, "rapl_pkg_watts": -5.0},
+        ])
+        res = check_physical_bounds(self.db)
+        self.assertEqual(res["checked_metrics"], 3)
+        self.assertEqual(res["total_violations"], 3)
+        by_col = {v["column"]: v for v in res["violations"]}
+        self.assertEqual(by_col["cpu_util"]["above_max"], 1)
+        self.assertEqual(by_col["k10temp_tctl"]["above_max"], 1)
+        self.assertEqual(by_col["rapl_pkg_watts"]["below_min"], 1)
+
+        with redirect_stdout(io.StringIO()) as out:
+            analyze_module.main(["--db", str(self.db), "--check-bounds"])
+        self.assertIn("3 violation(s)", out.getvalue())
 
 
 if __name__ == "__main__":

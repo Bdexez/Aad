@@ -50,6 +50,19 @@ class HtmlReportTest(unittest.TestCase):
             html_module.main(["--db", str(self.db), "--output", str(out_path)])
         self.assertEqual(exc.exception.code, 2)
 
+    def test_embeds_detected_episodes_when_baseline_label_is_provided(self):
+        rows = [
+            {"ts": 1000 * (i + 1), "boot_id": "a", "temp_c": 49.0 + (i % 3)} for i in range(6)
+        ] + [
+            {"ts": 10000 + 1000 * i, "boot_id": "a", "temp_c": 90.0} for i in range(4)
+        ]
+        self.storage.insert_samples(rows)
+        norm = self.storage.start_label(1000, "normal")
+        self.storage.end_label(7000, norm)
+        doc = render_html_report(self.db, baseline_label="normal", since=8000, threshold=4.0, min_samples=3)
+        self.assertIn("Épisodes anormaux détectés (1)", doc)
+        self.assertIn("temp_c (z=", doc)
+
 
 if __name__ == "__main__":
     unittest.main()

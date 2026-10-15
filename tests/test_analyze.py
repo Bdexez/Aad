@@ -19,6 +19,7 @@ from collector.analyze import (
     compare_labels,
     correlate_metric,
     detect_outliers,
+    detect_stuck_runs,
 )
 from collector.main import SCHEMA
 from collector.storage import Storage
@@ -352,6 +353,27 @@ class AnalyzeDatasetTest(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as out:
             analyze_module.main(["--db", str(self.db), "--check-bounds"])
         self.assertIn("3 violation(s)", out.getvalue())
+
+    def test_detect_stuck_runs_identifies_frozen_sensor_segments_per_boot(self):
+        self.storage.insert_samples([
+            {"ts": 1000, "boot_id": "a", "temp_c": 40.0},
+            {"ts": 2000, "boot_id": "a", "temp_c": 55.0},
+            {"ts": 3000, "boot_id": "a", "temp_c": 55.0},
+            {"ts": 4000, "boot_id": "a", "temp_c": 55.0},
+            {"ts": 5000, "boot_id": "a", "temp_c": 55.0},
+            {"ts": 6000, "boot_id": "b", "temp_c": 55.0},
+            {"ts": 7000, "boot_id": "b", "temp_c": 55.0},
+        ])
+        res = detect_stuck_runs(self.db, min_run=3, columns=["temp_c"])
+        self.assertEqual(len(res["stuck_metrics"]), 1)
+        m = res["stuck_metrics"][0]
+        self.assertEqual(m["longest_run"], 4)
+        self.assertEqual(m["longest_value"], 55.0)
+        self.assertEqual(m["longest_boot"], "a")
+
+        with redirect_stdout(io.StringIO()) as out:
+            analyze_module.main(["--db", str(self.db), "--stuck-runs", "--min-run", "3", "--columns", "temp_c"])
+        self.assertIn("max=4", out.getvalue())
 
 
 if __name__ == "__main__":

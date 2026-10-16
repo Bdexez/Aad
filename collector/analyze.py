@@ -16,7 +16,7 @@ import pathlib
 import re
 import sqlite3
 
-from .database import read_snapshot, sample_filter_sql, validate_time_range
+from .database import read_snapshot, resolve_last_minutes, sample_filter_sql, validate_time_range
 from .storage import quote_identifier
 
 _META_COLUMNS = frozenset({"sample_id", "ts", "boot_id"})
@@ -962,6 +962,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--boot", dest="boot_id", help="limiter les mesures à un boot_id")
     parser.add_argument("--since", type=int, help="epoch ms inclusif")
     parser.add_argument("--until", type=int, help="epoch ms exclusif")
+    parser.add_argument("--last-minutes", type=float, help="limiter aux N dernières minutes")
     parser.add_argument("--gap-factor", type=float, default=2.0,
                         help="multiple de la cadence médiane définissant un trou (défaut : 2.0)")
     parser.add_argument("--min-pairs", type=int, default=3,
@@ -994,49 +995,50 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     try:
+        since, until = resolve_last_minutes(args.last_minutes, args.since, args.until)
         if args.compare:
             result = compare_labels(
                 args.db, args.compare[0], args.compare[1],
-                boot_id=args.boot_id, since=args.since, until=args.until,
+                boot_id=args.boot_id, since=since, until=until,
             )
         elif args.correlate:
             result = correlate_metric(
                 args.db, args.correlate,
-                boot_id=args.boot_id, since=args.since, until=args.until,
+                boot_id=args.boot_id, since=since, until=until,
                 min_pairs=args.min_pairs,
             )
         elif args.outliers:
             result = detect_outliers(
-                args.db, boot_id=args.boot_id, since=args.since, until=args.until,
+                args.db, boot_id=args.boot_id, since=since, until=until,
                 z_threshold=args.z_threshold, columns=args.columns,
             )
         elif args.check_labels:
             result = audit_labels(
-                args.db, boot_id=args.boot_id, since=args.since, until=args.until,
+                args.db, boot_id=args.boot_id, since=since, until=until,
             )
         elif args.drift:
             result = analyze_drift(
-                args.db, boot_id=args.boot_id, since=args.since, until=args.until,
+                args.db, boot_id=args.boot_id, since=since, until=until,
                 slices=args.slices,
             )
         elif args.by:
             result = analyze_by_group(
-                args.db, args.by, boot_id=args.boot_id, since=args.since,
-                until=args.until, columns=args.columns,
+                args.db, args.by, boot_id=args.boot_id, since=since,
+                until=until, columns=args.columns,
             )
         elif args.check_bounds:
             result = check_physical_bounds(
-                args.db, boot_id=args.boot_id, since=args.since, until=args.until,
+                args.db, boot_id=args.boot_id, since=since, until=until,
             )
         elif args.stuck_runs:
             result = detect_stuck_runs(
-                args.db, boot_id=args.boot_id, since=args.since, until=args.until,
+                args.db, boot_id=args.boot_id, since=since, until=until,
                 min_run=args.min_run, columns=args.columns,
             )
         else:
             result = analyze_dataset(
-                args.db, boot_id=args.boot_id, since=args.since,
-                until=args.until, gap_factor=args.gap_factor,
+                args.db, boot_id=args.boot_id, since=since,
+                until=until, gap_factor=args.gap_factor,
             )
     except (ValueError, OSError, sqlite3.Error) as exc:
         parser.error(str(exc))

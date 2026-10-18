@@ -19,7 +19,7 @@ import sqlite3
 import sys
 from typing import TextIO
 
-from .database import read_snapshot, sample_filter_sql, validate_time_range
+from .database import read_snapshot, resolve_last_minutes, sample_filter_sql, validate_time_range
 from .export import _output
 from .storage import quote_identifier
 
@@ -247,6 +247,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--boot", dest="boot_id", help="limiter à un boot_id")
     parser.add_argument("--since", type=int, help="epoch ms inclusif")
     parser.add_argument("--until", type=int, help="epoch ms exclusif")
+    parser.add_argument("--last-minutes", type=float, help="limiter aux N dernières minutes")
     parser.add_argument("--columns", nargs="+", help="métriques numériques à inclure")
     parser.add_argument("--rolling", type=int, help="taille de fenêtre glissante (moyenne + écart-type)")
     parser.add_argument("--deltas", action="store_true", help="ajouter delta et vitesse par seconde")
@@ -256,10 +257,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="ajouter une colonne chronologique split (train/val/test) sans fuite")
     args = parser.parse_args(argv)
     try:
+        since, until = resolve_last_minutes(args.last_minutes, args.since, args.until)
         with _output(args.output) as target:
             count = export_features(
                 args.db, target, fmt=args.format, boot_id=args.boot_id,
-                since=args.since, until=args.until, columns=args.columns,
+                since=since, until=until, columns=args.columns,
                 rolling=args.rolling, deltas=args.deltas,
                 decode_throttle=args.decode_throttle,
                 split_ratios=tuple(args.split_ratios) if args.split_ratios else None,

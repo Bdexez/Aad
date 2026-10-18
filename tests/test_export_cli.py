@@ -108,3 +108,7 @@ class ExportCliTest(unittest.TestCase):
         ds_out, ds_status = self.cli("--bucket-ms", "100", "--format", "jsonl")
         self.assertEqual(len(ds_out.splitlines()), 2)
         self.assertIn("2 fenêtre(s)", ds_status)
+
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as err:
+            export_module.main(["--db", str(self.db), "--last-minutes", "5", "--since", "0"])
+        self.assertEqual(err.exception.code, 2)

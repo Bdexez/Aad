@@ -952,6 +952,103 @@ def detect_stuck_runs(
     }
 
 
+def detect_changepoints(
+    db: str | pathlib.Path,
+    column: str,
+    *,
+    boot_id: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+    window: int = 30,
+    threshold: float = 4.0,
+) -> dict:
+    """Détecte les ruptures de régime par fenêtre glissante bilatérale (score de Welch).
+
+    Compare [i - window : i] et [i : i + window] par `boot_id` en O(N), puis
+    applique une suppression des non-maxima sur une portée de `window` ticks.
+    """
+    if window < 3:
+        raise ValueError("--window doit être >= 3")
+    if not math.isfinite(threshold) or threshold <= 0:
+        raise ValueError("--cp-threshold doit être un nombre fini > 0")
+    validate_time_range(since, until)
+    where, params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
+    prefix = (where + " AND ") if where else " WHERE "
+    with read_snapshot(db) as conn:
+        metrics, order_col = _numeric_metrics(conn)
+        numeric_names = [name for name, _ in metrics]
+        if column not in numeric_names:
+            raise ValueError(f"métrique numérique introuvable: {column!r}")
+        qc = quote_identifier(column)
+        cursor = conn.execute(
+            f"SELECT s.boot_id, s.ts, s.{qc} FROM samples AS s{prefix}s.{qc} IS NOT NULL"
+            f" ORDER BY s.boot_id, s.{quote_identifier(order_col)}",
+            params,
+        )
+        per_boot: dict[str, list[tuple[int, float]]] = {}
+        for b, ts, val in cursor:
+            per_boot.setdefault(b, []).append((ts, float(val)))
+
+    changepoints: list[dict] = []
+    for b, series in per_boot.items():
+        n = len(series)
+        if n < 2 * window:
+            continue
+        vals = [v for _, v in series]
+        # Préfixes cumulatifs pour un calcul exact en O(N)
+        pref_sum = [0.0] * (n + 1)
+        pref_sq = [0.0] * (n + 1)
+        for idx, v in enumerate(vals):
+            pref_sum[idx + 1] = pref_sum[idx] + v
+            pref_sq[idx + 1] = pref_sq[idx] + v * v
+
+        candidates: list[tuple[int, float, float, float]] = []
+        for i in range(window, n - window + 1):
+            s1 = pref_sum[i] - pref_sum[i - window]
+            sq1 = pref_sq[i] - pref_sq[i - window]
+            s2 = pref_sum[i + window] - pref_sum[i]
+            sq2 = pref_sq[i + window] - pref_sq[i]
+            m1 = s1 / window
+            m2 = s2 / window
+            v1 = max(0.0, (sq1 - window * m1 * m1) / (window - 1))
+            v2 = max(0.0, (sq2 - window * m2 * m2) / (window - 1))
+            se = math.sqrt((v1 + v2) / window)
+            if se > 0.0:
+                score = (m2 - m1) / se
+            elif m2 != m1:
+                score = math.copysign(1e9, m2 - m1)
+            else:
+                score = 0.0
+            if abs(score) >= threshold:
+                candidates.append((i, m1, m2, score))
+
+        # Suppression des non-maxima dans un voisinage de +/- window
+        candidates.sort(key=lambda item: -abs(item[3]))
+        kept: list[tuple[int, float, float, float]] = []
+        for cand in candidates:
+            if all(abs(cand[0] - prev[0]) >= window for prev in kept):
+                kept.append(cand)
+        for i, m1, m2, score in sorted(kept, key=lambda item: item[0]):
+            changepoints.append({
+                "boot_id": b,
+                "ts": series[i][0],
+                "before_mean": m1,
+                "after_mean": m2,
+                "delta": m2 - m1,
+                "score": score,
+            })
+
+    changepoints.sort(key=lambda item: (-abs(item["score"]), item["ts"]))
+    return {
+        "boot_id": boot_id,
+        "window": {"since": since, "until": until},
+        "column": column,
+        "window_size": window,
+        "threshold": threshold,
+        "changepoints": changepoints,
+    }
+
+
 def _fmt(value: float | None, digits: int = 2) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
 
@@ -973,6 +1070,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="nombre de tranches temporelles pour --drift (défaut : 2)")
     parser.add_argument("--min-run", type=int, default=30,
                         help="longueur minimale d'une séquence figée pour --stuck-runs (défaut : 30)")
+    parser.add_argument("--window", type=int, default=30,
+                        help="taille de demi-fenêtre pour --changepoints (défaut : 30)")
+    parser.add_argument("--cp-threshold", type=float, default=4.0,
+                        help="seuil de score de Welch pour --changepoints (défaut : 4.0)")
     parser.add_argument("--columns", nargs="+", help="sous-ensemble de métriques (pour --outliers, --by, --stuck-runs)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--compare", nargs=2, metavar=("BASELINE", "TARGET"),
@@ -991,6 +1092,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                       help="vérifier les bornes physiques plausibles des sondes connues")
     mode.add_argument("--stuck-runs", action="store_true",
                       help="détecter les séquences consécutives de valeurs identiques (capteur figé)")
+    mode.add_argument("--changepoints", metavar="COLUMN",
+                      help="localiser les ruptures de régime d'une métrique par fenêtre glissante")
     parser.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
     args = parser.parse_args(argv)
 
@@ -1035,6 +1138,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.db, boot_id=args.boot_id, since=since, until=until,
                 min_run=args.min_run, columns=args.columns,
             )
+        elif args.changepoints:
+            result = detect_changepoints(
+                args.db, args.changepoints, boot_id=args.boot_id, since=since, until=until,
+                window=args.window, threshold=args.cp_threshold,
+            )
         else:
             result = analyze_dataset(
                 args.db, boot_id=args.boot_id, since=since,
@@ -1045,6 +1153,15 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.changepoints:
+        print(f"Ruptures de régime pour {result['column']} (fenêtre={result['window_size']}, seuil={result['threshold']}) :")
+        for cp in result["changepoints"]:
+            print(
+                f"  boot={cp['boot_id']} ts={cp['ts']} : {_fmt(cp['before_mean'])} → {_fmt(cp['after_mean'])} "
+                f"(Δ={_fmt(cp['delta'])}, score={_fmt(cp['score'])})"
+            )
         return
 
     if args.stuck_runs:

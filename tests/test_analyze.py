@@ -18,6 +18,7 @@ from collector.analyze import (
     check_physical_bounds,
     compare_labels,
     correlate_metric,
+    detect_changepoints,
     detect_outliers,
     detect_stuck_runs,
 )
@@ -374,6 +375,23 @@ class AnalyzeDatasetTest(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as out:
             analyze_module.main(["--db", str(self.db), "--stuck-runs", "--min-run", "3", "--columns", "temp_c"])
         self.assertIn("max=4", out.getvalue())
+
+    def test_detect_changepoints_locates_step_shift(self):
+        rows = [
+            {"ts": 1000 * (i + 1), "boot_id": "a", "temp_c": 45.0 + (i % 3) * 0.5} for i in range(10)
+        ] + [
+            {"ts": 1000 * (i + 11), "boot_id": "a", "temp_c": 75.0 + (i % 3) * 0.5} for i in range(10)
+        ]
+        self.storage.insert_samples(rows)
+        res = detect_changepoints(self.db, "temp_c", window=5, threshold=4.0)
+        self.assertEqual(len(res["changepoints"]), 1)
+        cp = res["changepoints"][0]
+        self.assertEqual(cp["ts"], 11000)
+        self.assertAlmostEqual(cp["delta"], 30.0, delta=1.0)
+
+        with redirect_stdout(io.StringIO()) as out:
+            analyze_module.main(["--db", str(self.db), "--changepoints", "temp_c", "--window", "5"])
+        self.assertIn("ts=11000", out.getvalue())
 
 
 if __name__ == "__main__":

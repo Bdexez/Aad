@@ -16,6 +16,7 @@ from . import (
     label,
     main as collect_main,
     report,
+    retention,
 )
 
 COMMANDS: dict[str, tuple[str, object]] = {
@@ -30,6 +31,7 @@ COMMANDS: dict[str, tuple[str, object]] = {
     "export": ("exporter mesures (CSV/JSONL/downsampled) ou événements", export.main),
     "features": ("exporter des features temporelles dérivées pour le ML", features.main),
     "backup": ("sauvegarder ou vérifier une base SQLite active", backup.main),
+    "prune": ("purger les anciennes données (dry-run par défaut)", retention.main),
 }
 
 

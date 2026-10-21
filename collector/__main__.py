@@ -15,6 +15,7 @@ from . import (
     html_report,
     label,
     main as collect_main,
+    merge,
     report,
     retention,
 )
@@ -32,6 +33,7 @@ COMMANDS: dict[str, tuple[str, object]] = {
     "features": ("exporter des features temporelles dérivées pour le ML", features.main),
     "backup": ("sauvegarder ou vérifier une base SQLite active", backup.main),
     "prune": ("purger les anciennes données (dry-run par défaut)", retention.main),
+    "merge": ("fusionner plusieurs bases SQLite AAD", merge.main),
 }
 
 

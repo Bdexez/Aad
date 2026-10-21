@@ -294,6 +294,30 @@ class BaselineDetectorTest(unittest.TestCase):
             ])
         self.assertEqual(exc.exception.code, 2)
 
+    def test_rms_score_mode_filters_single_sensor_glitch_and_catches_multivariate_shift(self):
+        # 2 capteurs : temp_c (~50 ± 1) et fan_rpm (~1200 ± 10)
+        self.seed_experiment()
+        # Ajouter un épisode de 3 ticks où seul temp_c dévie de +5 sigma (max=5, rms=5/sqrt(2)≈3.53)
+        # puis 3 ticks où les DEUX capteurs dévient de +5 sigma (max=5, rms=5.0).
+        self.storage.insert_samples([
+            {"ts": 20000, "boot_id": "b", "temp_c": 57.5, "fan_rpm": 1200.0},
+            {"ts": 21000, "boot_id": "b", "temp_c": 57.5, "fan_rpm": 1200.0},
+            {"ts": 22000, "boot_id": "b", "temp_c": 57.5, "fan_rpm": 1200.0},
+            {"ts": 23000, "boot_id": "b", "temp_c": 57.5, "fan_rpm": 1275.0},
+            {"ts": 24000, "boot_id": "b", "temp_c": 57.5, "fan_rpm": 1275.0},
+            {"ts": 25000, "boot_id": "b", "temp_c": 57.5, "fan_rpm": 1275.0},
+        ])
+        res_rms = detect_anomalies(
+            self.db, baseline_label="normal", boot_id="b",
+            score_mode="rms", threshold=4.2, min_samples=3,
+        )
+        self.assertEqual(res_rms["score_mode"], "rms")
+        self.assertEqual(len(res_rms["episodes"]), 1)
+        self.assertEqual(res_rms["episodes"][0]["ts_start"], 23000)
+
+        with self.assertRaises(ValueError):
+            detect_anomalies(self.db, baseline_label="normal", score_mode="invalid")
+
 
 if __name__ == "__main__":
     unittest.main()

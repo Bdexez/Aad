@@ -1049,6 +1049,87 @@ def detect_changepoints(
     }
 
 
+def detect_collinearity(
+    db: str | pathlib.Path,
+    *,
+    boot_id: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+    r_threshold: float = 0.95,
+    min_pairs: int = 3,
+    columns: Sequence[str] | None = None,
+) -> dict:
+    """Identifie les paires de sondes numériques redondantes (|r| >= r_threshold).
+
+    Utile avant modélisation pour éviter de sur-pondérer deux capteurs qui
+    mesurent essentiellement le même signal physique (ex. Tctl vs Tccd1).
+    """
+    if not math.isfinite(r_threshold) or not (0.0 < r_threshold <= 1.0):
+        raise ValueError("--r-threshold doit être dans ]0, 1]")
+    if min_pairs < 2:
+        raise ValueError("--min-pairs doit être >= 2")
+    validate_time_range(since, until)
+    where, params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
+    with read_snapshot(db) as conn:
+        metrics, _ = _numeric_metrics(conn)
+        numeric_names = [name for name, _ in metrics]
+        if columns is not None:
+            selected = list(columns)
+            if not selected:
+                raise ValueError("aucune colonne sélectionnée")
+            unknown = set(selected) - set(numeric_names)
+            if unknown:
+                raise ValueError(f"métriques numériques introuvables: {', '.join(sorted(unknown))}")
+        else:
+            selected = numeric_names
+
+        pairs_found: list[dict] = []
+        for i, col_a in enumerate(selected):
+            qa = quote_identifier(col_a)
+            for col_b in selected[i + 1 :]:
+                qb = quote_identifier(col_b)
+                cond = f"{qa} IS NOT NULL AND {qb} IS NOT NULL"
+                n, ma, mb = conn.execute(
+                    f"SELECT COUNT(CASE WHEN {cond} THEN 1 END),"
+                    f" AVG(CASE WHEN {cond} THEN {qa} END),"
+                    f" AVG(CASE WHEN {cond} THEN {qb} END)"
+                    f" FROM samples AS s{where}",
+                    params,
+                ).fetchone()
+                if n < min_pairs or ma is None or mb is None:
+                    continue
+                sxy, sxx, syy = conn.execute(
+                    f"SELECT SUM(CASE WHEN {cond} THEN ({qa} - ?) * ({qb} - ?) END),"
+                    f" SUM(CASE WHEN {cond} THEN ({qa} - ?) * ({qa} - ?) END),"
+                    f" SUM(CASE WHEN {cond} THEN ({qb} - ?) * ({qb} - ?) END)"
+                    f" FROM samples AS s{where}",
+                    [ma, mb, ma, ma, mb, mb, *params],
+                ).fetchone()
+                if sxy is None or sxx is None or syy is None:
+                    continue
+                denom = math.sqrt(max(0.0, sxx) * max(0.0, syy))
+                if denom <= 0.0:
+                    continue
+                r = max(-1.0, min(1.0, sxy / denom))
+                if abs(r) >= r_threshold:
+                    pairs_found.append({
+                        "column_a": col_a,
+                        "column_b": col_b,
+                        "pairs": n,
+                        "r": r,
+                        "r_squared": r * r,
+                    })
+        pairs_found.sort(key=lambda item: (-abs(item["r"]), item["column_a"], item["column_b"]))
+
+    return {
+        "boot_id": boot_id,
+        "window": {"since": since, "until": until},
+        "r_threshold": r_threshold,
+        "min_pairs": min_pairs,
+        "collinear_pairs": pairs_found,
+    }
+
+
 def _fmt(value: float | None, digits: int = 2) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
 
@@ -1074,7 +1155,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="taille de demi-fenêtre pour --changepoints (défaut : 30)")
     parser.add_argument("--cp-threshold", type=float, default=4.0,
                         help="seuil de score de Welch pour --changepoints (défaut : 4.0)")
-    parser.add_argument("--columns", nargs="+", help="sous-ensemble de métriques (pour --outliers, --by, --stuck-runs)")
+    parser.add_argument("--r-threshold", type=float, default=0.95,
+                        help="seuil |r| pour --collinear (défaut : 0.95)")
+    parser.add_argument("--columns", nargs="+", help="sous-ensemble de métriques (pour --outliers, --by, --stuck-runs, --collinear)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--compare", nargs=2, metavar=("BASELINE", "TARGET"),
                       help="comparer les métriques numériques entre deux labels")
@@ -1094,6 +1177,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                       help="détecter les séquences consécutives de valeurs identiques (capteur figé)")
     mode.add_argument("--changepoints", metavar="COLUMN",
                       help="localiser les ruptures de régime d'une métrique par fenêtre glissante")
+    mode.add_argument("--collinear", action="store_true",
+                      help="lister les paires de sondes numériques redondantes (|r| >= --r-threshold)")
     parser.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
     args = parser.parse_args(argv)
 
@@ -1143,6 +1228,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.db, args.changepoints, boot_id=args.boot_id, since=since, until=until,
                 window=args.window, threshold=args.cp_threshold,
             )
+        elif args.collinear:
+            result = detect_collinearity(
+                args.db, boot_id=args.boot_id, since=since, until=until,
+                r_threshold=args.r_threshold, min_pairs=args.min_pairs, columns=args.columns,
+            )
         else:
             result = analyze_dataset(
                 args.db, boot_id=args.boot_id, since=since,
@@ -1153,6 +1243,12 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.collinear:
+        print(f"Paires colinéaires (|r| >= {result['r_threshold']}, min_pairs={result['min_pairs']}) :")
+        for item in result["collinear_pairs"]:
+            print(f"  {item['column_a']} ↔ {item['column_b']} : r={_fmt(item['r'], 3)} (n={item['pairs']})")
         return
 
     if args.changepoints:

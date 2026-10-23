@@ -19,6 +19,7 @@ from collector.analyze import (
     compare_labels,
     correlate_metric,
     detect_changepoints,
+    detect_collinearity,
     detect_outliers,
     detect_stuck_runs,
 )
@@ -392,6 +393,24 @@ class AnalyzeDatasetTest(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as out:
             analyze_module.main(["--db", str(self.db), "--changepoints", "temp_c", "--window", "5"])
         self.assertIn("ts=11000", out.getvalue())
+
+    def test_detect_collinearity_finds_redundant_sensor_pairs(self):
+        self.storage.ensure_columns(["temp_dup", "noise"])
+        self.storage.insert_samples([
+            {"ts": 1000, "boot_id": "a", "temp_c": 40.0, "temp_dup": 42.0, "noise": 1.0},
+            {"ts": 2000, "boot_id": "a", "temp_c": 50.0, "temp_dup": 52.0, "noise": 5.0},
+            {"ts": 3000, "boot_id": "a", "temp_c": 60.0, "temp_dup": 62.0, "noise": 2.0},
+            {"ts": 4000, "boot_id": "a", "temp_c": 70.0, "temp_dup": 72.0, "noise": 4.0},
+        ])
+        res = detect_collinearity(self.db, r_threshold=0.95)
+        self.assertEqual(len(res["collinear_pairs"]), 1)
+        pair = res["collinear_pairs"][0]
+        self.assertEqual((pair["column_a"], pair["column_b"]), ("temp_c", "temp_dup"))
+        self.assertAlmostEqual(pair["r"], 1.0)
+
+        with redirect_stdout(io.StringIO()) as out:
+            analyze_module.main(["--db", str(self.db), "--collinear"])
+        self.assertIn("temp_c ↔ temp_dup", out.getvalue())
 
 
 if __name__ == "__main__":

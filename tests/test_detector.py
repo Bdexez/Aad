@@ -318,6 +318,23 @@ class BaselineDetectorTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             detect_anomalies(self.db, baseline_label="normal", score_mode="invalid")
 
+    def test_export_scores_writes_per_sample_csv_and_refuses_overwrite(self):
+        import csv
+
+        self.seed_experiment()
+        scores_csv = self.db.with_name("scores.csv")
+        detect_anomalies(
+            self.db, baseline_label="normal", since=11000,
+            threshold=4.0, min_samples=3, export_scores=scores_csv,
+        )
+        with scores_csv.open(encoding="utf-8", newline="") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(len(rows), 7)
+        self.assertEqual(rows[-1]["top_sensor"], "temp_c")
+        self.assertEqual(rows[-1]["exceeds_threshold"], "1")
+        with self.assertRaises(FileExistsError):
+            detect_anomalies(self.db, baseline_label="normal", since=11000, export_scores=scores_csv)
+
 
 if __name__ == "__main__":
     unittest.main()

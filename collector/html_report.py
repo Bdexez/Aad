@@ -13,7 +13,7 @@ import html
 import pathlib
 import sqlite3
 
-from .analyze import _numeric_metrics, analyze_dataset, audit_labels
+from .analyze import _numeric_metrics, analyze_dataset, audit_labels, check_physical_bounds
 from .database import read_snapshot, resolve_last_minutes, sample_filter_sql, validate_time_range
 from .detector import detect_anomalies
 from .report import dataset_report
@@ -104,6 +104,7 @@ def render_html_report(
     rep = dataset_report(db, boot_id=boot_id, since=since, until=until)
     ana = analyze_dataset(db, boot_id=boot_id, since=since, until=until)
     aud = audit_labels(db, boot_id=boot_id, since=since, until=until)
+    bounds = check_physical_bounds(db, boot_id=boot_id, since=since, until=until)
     sparks = _fetch_sparklines(db, boot_id=boot_id, since=since, until=until)
     detection = None
     if baseline_label is not None or load_model is not None:
@@ -140,6 +141,21 @@ def render_html_report(
         f"<td>{esc(str(e['severity'] or ''))}</td><td>{e['count']}</td></tr>"
         for e in rep["events"]
     ) or '<tr><td colspan="4">Aucun événement</td></tr>'
+
+    bounds_section = ""
+    if bounds["violations"]:
+        b_rows = "".join(
+            f"<tr><td><code>{esc(v['column'])}</code></td><td>{esc(v['unit'])}</td>"
+            f"<td>{v['below_min']}</td><td>{v['above_max']}</td>"
+            f"<td>[{_fmt(v['observed_min'])}, {_fmt(v['observed_max'])}]</td></tr>"
+            for v in bounds["violations"]
+        )
+        bounds_section = (
+            f"<h2>Violations de bornes physiques ({bounds['total_violations']})</h2>"
+            "<table><thead><tr><th>Colonne</th><th>Plage attendue</th><th>&lt; min</th>"
+            "<th>&gt; max</th><th>Observé</th></tr></thead>"
+            f"<tbody>{b_rows}</tbody></table>"
+        )
 
     episodes_section = ""
     if detection is not None:
@@ -190,6 +206,7 @@ def render_html_report(
   <div class="card"><div class="label">Couverture labels</div><div class="val">{esc(cov)}</div></div>
   <div class="card"><div class="label">Fenêtres labels</div><div class="val">{aud['total_windows']} ({len(aud['open_windows'])} ouv.)</div></div>
   <div class="card"><div class="label">Multi-labels</div><div class="val">{aud['cross_label_overlap_samples']}</div></div>
+  <div class="card"><div class="label">Bornes physiques</div><div class="val">{bounds['total_violations']} viol.</div></div>
 </div>
 <h2>Cadence par boot</h2>
 <table><thead><tr><th>Boot</th><th>Mesures</th><th>Médiane</th><th>p95</th><th>Trous</th><th>Doublons</th><th>Retours</th></tr></thead>
@@ -200,6 +217,7 @@ def render_html_report(
 <h2>Événements</h2>
 <table><thead><tr><th>Source</th><th>Genre</th><th>Gravité</th><th>Total</th></tr></thead>
 <tbody>{event_rows}</tbody></table>
+{bounds_section}
 {episodes_section}
 </body>
 </html>

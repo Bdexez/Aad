@@ -63,6 +63,13 @@ class HtmlReportTest(unittest.TestCase):
         self.assertIn("Épisodes anormaux détectés (1)", doc)
         self.assertIn("temp_c (z=", doc)
 
+    def test_renders_physical_bounds_violations_table_when_present(self):
+        self.storage.ensure_columns(["cpu_util"])
+        self.storage.insert_samples([{"ts": 1000, "boot_id": "a", "cpu_util": 1.8}])
+        doc = render_html_report(self.db)
+        self.assertIn("Violations de bornes physiques (1)", doc)
+        self.assertIn("cpu_util", doc)
+
 
 if __name__ == "__main__":
     unittest.main()

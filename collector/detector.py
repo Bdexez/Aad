@@ -237,6 +237,47 @@ def _f1_metrics(tp: int, fp: int, fn: int, tn: int) -> dict:
     }
 
 
+def _roc_pr_auc(scored: Sequence[tuple[float, bool]]) -> tuple[float | None, float | None]:
+    """Calcule ROC-AUC (avec rangs moyens sur ex-aequo) et PR-AUC (Average Precision)."""
+    n_pos = sum(1 for _, pos in scored if pos)
+    n_neg = len(scored) - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return None, None
+
+    # ROC-AUC via statistique de Mann-Whitney U (gère exactement les ex-aequo)
+    asc = sorted(scored, key=lambda item: item[0])
+    rank_sum_pos = 0.0
+    i = 0
+    n = len(asc)
+    while i < n:
+        j = i + 1
+        while j < n and asc[j][0] == asc[i][0]:
+            j += 1
+        avg_rank = (i + 1 + j) / 2.0
+        pos_in_tie = sum(1 for k in range(i, j) if asc[k][1])
+        rank_sum_pos += pos_in_tie * avg_rank
+        i = j
+    roc_auc = (rank_sum_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+
+    # PR-AUC (Average Precision) en triant par score décroissant (groupé par ex-aequo)
+    desc = sorted(scored, key=lambda item: -item[0])
+    tp_cum = 0
+    ap_sum = 0.0
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and desc[j][0] == desc[i][0]:
+            j += 1
+        pos_in_tie = sum(1 for k in range(i, j) if desc[k][1])
+        if pos_in_tie:
+            tp_cum += pos_in_tie
+            precision_at_j = tp_cum / j
+            ap_sum += precision_at_j * pos_in_tie
+        i = j
+    pr_auc = ap_sum / n_pos
+    return max(0.0, min(1.0, roc_auc)), max(0.0, min(1.0, pr_auc))
+
+
 def detect_anomalies(
     db: str | pathlib.Path,
     *,
@@ -398,6 +439,7 @@ def detect_anomalies(
         anomalous_samples = 0
         # Pour l'évaluation : on attend la fin de chaque run pour savoir s'il atteint min_samples.
         tp = fp = fn = tn = 0
+        eval_scores: list[tuple[float, bool]] = []
 
         run_boot: str | None = None
         run_ts_start: int | None = None
@@ -508,6 +550,8 @@ def detect_anomalies(
                 if n_obs > 0:
                     rms_z = math.sqrt(sq_sum / n_obs)
                     sample_score = rms_z if score_mode == "rms" else max_abs
+                    if eval_label is not None:
+                        eval_scores.append((sample_score, is_pos))
                 else:
                     rms_z = 0.0
                     sample_score = 0.0
@@ -625,9 +669,12 @@ def detect_anomalies(
         "episodes": episodes,
     }
     if eval_label is not None:
+        roc_auc, pr_auc = _roc_pr_auc(eval_scores)
         result["evaluation"] = {
             "label": eval_label,
             **_f1_metrics(tp, fp, fn, tn),
+            "roc_auc": roc_auc,
+            "pr_auc": pr_auc,
             **(episode_eval or {}),
         }
     return result
@@ -830,10 +877,13 @@ def tune_threshold(
             r["threshold"],
         ),
     )
+    roc_auc, pr_auc = _roc_pr_auc([(s, p) for _, s, p in scored if s is not None])
     return {
         "eval_label": eval_label,
         "samples": len(scored),
         "min_samples": min_samples,
+        "roc_auc": roc_auc,
+        "pr_auc": pr_auc,
         "best": best,
         "grid": results,
     }

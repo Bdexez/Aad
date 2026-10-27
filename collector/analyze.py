@@ -1134,6 +1134,39 @@ def _fmt(value: float | None, digits: int = 2) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
 
 
+def format_markdown(report: dict) -> str:
+    """Formate le rapport exploratoire `analyze_dataset()` en tableaux Markdown (GFM)."""
+    lines = [f"# Analyse du dataset AAD ({report['samples']} mesures)", ""]
+    lines.append("## Cadence par boot")
+    lines.append("| Boot | Mesures | Médiane (ms) | p95 (ms) | Trous | Doublons | Retours |")
+    lines.append("| :--- | ---: | ---: | ---: | ---: | ---: | ---: |")
+    for b in report["cadence"]:
+        lines.append(
+            f"| `{b['boot_id']}` | {b['samples']} | {_fmt(b['median_dt_ms'], 1)} | "
+            f"{_fmt(b['p95_dt_ms'], 1)} | {b['gaps']} | {b['duplicate_timestamps']} | {b['clock_regressions']} |"
+        )
+    lines.append("")
+    lines.append("## Métriques numériques")
+    lines.append("| Colonne | Présence | Min | Moyenne | Écart-type | Max | Constante |")
+    lines.append("| :--- | ---: | ---: | ---: | ---: | ---: | :---: |")
+    for m in report["metrics"]:
+        lines.append(
+            f"| `{m['column']}` | {m['present']} | {_fmt(m['min'])} | "
+            f"{_fmt(m['mean'])} | {_fmt(m['std'])} | {_fmt(m['max'])} | {'oui' if m['is_constant'] else 'non'} |"
+        )
+    if report["labels"]:
+        lines.append("")
+        lines.append("## Classes labellisées")
+        lines.append("| Label | Fenêtres | Ouvertes | Mesures | Événements |")
+        lines.append("| :--- | ---: | ---: | ---: | ---: |")
+        for item in report["labels"]:
+            lines.append(
+                f"| `{item['label']}` | {item['windows']} | {item['open_windows']} | "
+                f"{item['samples']} | {item['events']} |"
+            )
+    return "\n".join(lines)
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Analyse exploratoire du dataset AAD")
     parser.add_argument("--db", default="data/metrics.db", help="base SQLite existante")
@@ -1179,8 +1212,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                       help="localiser les ruptures de régime d'une métrique par fenêtre glissante")
     mode.add_argument("--collinear", action="store_true",
                       help="lister les paires de sondes numériques redondantes (|r| >= --r-threshold)")
-    parser.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
+    output_fmt = parser.add_mutually_exclusive_group()
+    output_fmt.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
+    output_fmt.add_argument("--markdown", action="store_true",
+                            help="sortie Markdown GFM (mode exploratoire par défaut)")
     args = parser.parse_args(argv)
+    if args.markdown and any((
+        args.compare, args.correlate, args.outliers, args.check_labels,
+        args.drift, args.by, args.check_bounds, args.stuck_runs, args.changepoints, args.collinear,
+    )):
+        parser.error("--markdown s'applique uniquement au mode exploratoire par défaut")
 
     try:
         since, until = resolve_last_minutes(args.last_minutes, args.since, args.until)
@@ -1243,6 +1284,10 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.markdown:
+        print(format_markdown(result))
         return
 
     if args.collinear:

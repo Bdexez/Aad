@@ -412,6 +412,20 @@ class AnalyzeDatasetTest(unittest.TestCase):
             analyze_module.main(["--db", str(self.db), "--collinear"])
         self.assertIn("temp_c ↔ temp_dup", out.getvalue())
 
+    def test_markdown_output_renders_gfm_tables_and_rejects_submodes(self):
+        self.storage.insert_samples([
+            {"ts": 1000, "boot_id": "a", "temp_c": 42.0, "stuck": 1.0},
+            {"ts": 2000, "boot_id": "a", "temp_c": 44.0, "stuck": 1.0},
+        ])
+        with redirect_stdout(io.StringIO()) as out:
+            analyze_module.main(["--db", str(self.db), "--markdown"])
+        md = out.getvalue()
+        self.assertIn("# Analyse du dataset AAD (2 mesures)", md)
+        self.assertIn("| `temp_c` |", md)
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exc:
+            analyze_module.main(["--db", str(self.db), "--drift", "--markdown"])
+        self.assertEqual(exc.exception.code, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

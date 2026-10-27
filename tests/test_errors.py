@@ -104,3 +104,28 @@ class CatalogueTest(unittest.TestCase):
     def test_catalogue_is_deduplicated_by_kind(self):
         kinds = [k for k, _, _ in errors.catalogue()]
         self.assertEqual(len(kinds), len(set(kinds)))
+
+    def test_rules_have_no_duplicate_kind_or_pattern_and_benign_never_shadows_criticals(self):
+        seen_kinds = [rule.kind for rule in errors.RULES]
+        self.assertEqual(len(seen_kinds), len(set(seen_kinds)))
+        critical_samples = {
+            "mce_uncorrected": "Machine Check Exception: 5 Bank 4",
+            "whea": "Hardware error from APEI Generic Hardware Error Source: 1",
+            "ecc_ue": "EDAC MC0: 1 UE memory read error on DIMM_A1",
+            "panic": "Kernel panic - not syncing: Fatal exception",
+            "oops": "BUG: unable to handle kernel paging request",
+            "hard_lockup": "watchdog: Watchdog detected hard LOCKUP on cpu 0",
+            "gpu_xid": "NVRM: Xid (PCI:0000:01:00): 79, GPU has fallen off the bus",
+            "gpu_reset": "amdgpu 0000:03:00.0: amdgpu: GPU reset begin!",
+            "gpu_ecc": "amdgpu: RAS uncorrectable error detected",
+            "fs_error": "EXT4-fs error (device nvme0n1p2): ext4_find_entry",
+            "pcie_fatal": "pcieport 0000:00:01.1: AER: Uncorrected (Fatal) error",
+            "thermal_trip": "CPU3: Core temperature above threshold, cpu clock throttled",
+        }
+        for kind, sample in critical_samples.items():
+            with self.subTest(kind=kind):
+                self.assertIsNone(errors.BENIGN.search(sample))
+                rule = errors.classify(sample, level=2)
+                self.assertIsNotNone(rule)
+                self.assertEqual(rule.kind, kind)
+                self.assertEqual(rule.severity, errors.CRITICAL)

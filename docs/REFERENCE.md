@@ -124,12 +124,22 @@ board.
 
 ```
 collector/
-├─ main.py            fixed-rate loop, reader lifecycle
+├─ __main__.py        unified CLI dispatcher (`python -m collector <cmd>`)
+├─ main.py            fixed-rate loop, reader lifecycle, --doctor/--scan (--json)
+├─ database.py        read-only snapshots and shared time-window SQL helpers
 ├─ storage.py         SQLite (evolving schema, batching, deduplicated events, labels)
 ├─ registry.py        sysfs resolution (hwmon by name, tolerant reads)
 ├─ errors.py          CATALOGUE of detectable errors (data, not code)
-├─ label.py           experiment annotation CLI
-├─ export.py          read-only streaming CSV export with experiment labels
+├─ label.py           experiment annotation CLI (start/end/list/note/delete/export/import)
+├─ report.py          dataset completeness and annotation coverage
+├─ html_report.py     standalone offline HTML campaign report with inline SVG sparklines
+├─ analyze.py         exploratory stats, cadence, correlations, outliers, drift, bounds, changepoints
+├─ detector.py        zero-dependency explainable baseline anomaly detector & tuner
+├─ export.py          read-only streaming CSV/JSONL, downsampled and events export
+├─ features.py        streaming ML feature engineering (deltas, rolling stats, throttle flags, splits)
+├─ backup.py          consistent online backup and read-only verification (--verify)
+├─ retention.py       safe database pruning with dry-run default
+├─ merge.py           safe multi-database consolidation with schema union
 └─ readers/
    ├─ base.py         Reader contract + ReaderState (failures, event channel)
    ├─ kmsg.py         kernel errors (/dev/kmsg or journalctl)

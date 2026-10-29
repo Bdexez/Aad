@@ -9,7 +9,7 @@ import unittest
 
 from collector import retention as retention_module
 from collector.main import SCHEMA
-from collector.retention import prune_database
+from collector.retention import prune_boot, prune_database
 from collector.storage import Storage
 
 
@@ -58,6 +58,15 @@ class RetentionTest(unittest.TestCase):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exc:
             retention_module.main(["--db", str(self.db), "--before-ts", "300", "--vacuum"])
         self.assertEqual(exc.exception.code, 2)
+
+    def test_prune_boot_removes_only_selected_boot_and_respects_dry_run(self):
+        dry = prune_boot(self.db, boot_id="old-boot", dry_run=True)
+        self.assertEqual((dry["samples"], dry["boots"]), (2, 1))
+        applied = prune_boot(self.db, boot_id="old-boot", dry_run=False)
+        self.assertEqual((applied["samples"], applied["boots"]), (2, 1))
+        with Storage(self.db, SCHEMA) as storage:
+            self.assertEqual(storage.count_samples(), 1)
+            self.assertEqual(storage.conn.execute("SELECT boot_id FROM boots").fetchall(), [("new-boot",)])
 
 
 if __name__ == "__main__":

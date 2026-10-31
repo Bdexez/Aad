@@ -33,6 +33,16 @@ class CodeQualityGuardTest(unittest.TestCase):
                     root = node.module.split(".")[0]
                     self.assertIn(root, stdlib | OPTIONAL_DEPS, f"dépendance non-stdlib {root!r} dans {path}")
 
+    def test_pyproject_declares_zero_required_dependencies(self):
+        pyproject = COLLECTOR_DIR.parent / "pyproject.toml"
+        self.assertTrue(pyproject.is_file())
+        if sys.version_info >= (3, 11):
+            import tomllib
+
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+            self.assertEqual(data["project"]["dependencies"], [])
+            self.assertEqual(data["project"]["scripts"]["aad"], "collector.__main__:main")
+
 
 if __name__ == "__main__":
     unittest.main()

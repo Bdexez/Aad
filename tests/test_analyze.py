@@ -23,6 +23,7 @@ from collector.analyze import (
     detect_missing_blocks,
     detect_outliers,
     detect_stuck_runs,
+    lag_correlate,
 )
 from collector.main import SCHEMA
 from collector.storage import Storage
@@ -446,6 +447,23 @@ class AnalyzeDatasetTest(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as out:
             analyze_module.main(["--db", str(self.db), "--missing-blocks", "--min-missing", "3", "--columns", "temp_c"])
         self.assertIn("max=3", out.getvalue())
+
+    def test_lag_correlate_detects_thermal_response_delay(self):
+        self.storage.ensure_columns(["power_w"])
+        # temp_c[t] suit exactement power_w[t - 2] (latence thermique de 2 ticks)
+        powers = [20.0, 20.0, 80.0, 90.0, 40.0, 100.0, 30.0, 70.0, 25.0, 85.0]
+        rows = []
+        for i, p in enumerate(powers):
+            t = powers[i - 2] if i >= 2 else 20.0
+            rows.append({"ts": 1000 * (i + 1), "boot_id": "a", "power_w": p, "temp_c": t})
+        self.storage.insert_samples(rows)
+        res = lag_correlate(self.db, "temp_c", "power_w", max_lag=4)
+        self.assertEqual(res["best"]["lag"], 2)
+        self.assertAlmostEqual(res["best"]["r"], 1.0)
+
+        with redirect_stdout(io.StringIO()) as out:
+            analyze_module.main(["--db", str(self.db), "--lag-correlate", "temp_c", "power_w", "--max-lag", "4"])
+        self.assertIn("meilleur lag=2", out.getvalue())
 
 
 if __name__ == "__main__":

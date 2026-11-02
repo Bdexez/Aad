@@ -18,12 +18,14 @@ from . import (
     merge,
     report,
     retention,
+    summary,
 )
 
 COMMANDS: dict[str, tuple[str, object]] = {
     "run": ("lancer la collecte continue", lambda argv: collect_main.main(argv)),
     "doctor": ("diagnostiquer les capteurs et sources d'erreurs", lambda argv: collect_main.main(["--doctor", *argv])),
     "scan": ("classer les erreurs noyau du boot courant", lambda argv: collect_main.main(["--scan", *argv])),
+    "summary": ("synthèse globale d'intégrité et de qualité de la base", summary.main),
     "label": ("gérer les annotations d'expériences", label.main),
     "report": ("rapport de complétude du dataset", report.main),
     "html-report": ("générer un rapport HTML autonome avec sparklines SVG", html_report.main),

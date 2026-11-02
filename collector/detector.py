@@ -966,6 +966,63 @@ def benchmark_configs(
     }
 
 
+def check_model_compatibility(
+    db: str | pathlib.Path,
+    model_path: str | pathlib.Path,
+    *,
+    boot_id: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+) -> dict:
+    """Vérifie la compatibilité d'un modèle JSON sauvegardé avec une base cible."""
+    validate_time_range(since, until)
+    meta, features, grouped = load_baseline_model(model_path)
+    where, params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
+    with read_snapshot(db) as conn:
+        metrics, _ = _numeric_metrics(conn)
+        numeric_set = {name for name, _ in metrics}
+        all_cols = {f[1] for f in conn.execute("PRAGMA table_info(samples)").fetchall()}
+
+        model_cols = [fb.column for fb in features]
+        matched = [c for c in model_cols if c in numeric_set]
+        missing = [c for c in model_cols if c not in numeric_set]
+
+        control_for = meta.get("control_for")
+        control_ok = control_for is None or control_for in numeric_set
+
+        group_by = meta.get("group_by")
+        group_ok = group_by is None or group_by in all_cols
+        seen_groups: list[str] = []
+        unseen_groups: list[str] = []
+        if group_by is not None and group_ok:
+            qg = quote_identifier(group_by)
+            prefix = (where + " AND ") if where else " WHERE "
+            observed = {
+                str(r[0])
+                for r in conn.execute(
+                    f"SELECT DISTINCT s.{qg} FROM samples AS s{prefix}s.{qg} IS NOT NULL",
+                    params,
+                )
+            }
+            trained = set(grouped)
+            seen_groups = sorted(observed & trained)
+            unseen_groups = sorted(observed - trained)
+
+    compatible = bool(matched) and control_ok and group_ok
+    return {
+        "model": str(model_path),
+        "compatible": compatible,
+        "matched_features": matched,
+        "missing_features": missing,
+        "control_for": control_for,
+        "control_for_present": control_ok,
+        "group_by": group_by,
+        "group_by_present": group_ok,
+        "seen_groups": seen_groups,
+        "unseen_groups": unseen_groups,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Détecteur statistique d'anomalies AAD (z-score robuste / MAD)"
@@ -1000,6 +1057,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="calibrer le seuil optimal (F1) sur --eval-label")
     parser.add_argument("--benchmark", action="store_true",
                         help="comparer plusieurs stratégies (raw/control-for/group-by × max/rms) sur --eval-label")
+    parser.add_argument("--check-model", action="store_true",
+                        help="vérifier la compatibilité de --load-model avec la base cible")
     parser.add_argument("--thresholds", nargs="+", type=float,
                         help="grille de seuils personnalisée pour --tune-threshold")
     parser.add_argument("--output", default="-",
@@ -1014,6 +1073,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--load-model ne se combine pas avec les options --baseline-*")
     if args.load_model is None and not has_baseline_opts:
         parser.error("spécifiez une référence (--baseline-label, --baseline-boot, --baseline-since/--baseline-until ou --load-model)")
+    if args.check_model and args.load_model is None:
+        parser.error("--check-model nécessite --load-model")
     if args.tune_threshold and args.benchmark:
         parser.error("--tune-threshold et --benchmark sont mutuellement exclusifs")
     if (args.tune_threshold or args.benchmark) and not args.eval_label:
@@ -1023,7 +1084,11 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     try:
         since, until = resolve_last_minutes(args.last_minutes, args.since, args.until)
-        if args.benchmark:
+        if args.check_model:
+            result = check_model_compatibility(
+                args.db, args.load_model, boot_id=args.boot_id, since=since, until=until,
+            )
+        elif args.benchmark:
             result = benchmark_configs(
                 args.db,
                 eval_label=args.eval_label,
@@ -1090,6 +1155,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     def emit_output(stream) -> None:
         if args.json:
             stream.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+            return
+
+        if args.check_model:
+            verdict = "COMPATIBLE" if result["compatible"] else "INCOMPATIBLE"
+            print(
+                f"Modèle {result['model']} : {verdict} "
+                f"({len(result['matched_features'])} présentes, {len(result['missing_features'])} manquantes)",
+                file=stream,
+            )
+            if result["unseen_groups"]:
+                print(f"  régimes non vus à l'apprentissage : {', '.join(result['unseen_groups'])}", file=stream)
             return
 
         if args.benchmark:

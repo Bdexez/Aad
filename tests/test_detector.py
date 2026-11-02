@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 from collector import detector as detector_module
-from collector.detector import benchmark_configs, detect_anomalies, tune_threshold
+from collector.detector import benchmark_configs, check_model_compatibility, detect_anomalies, tune_threshold
 from collector.main import SCHEMA
 from collector.storage import Storage
 
@@ -367,6 +367,21 @@ class BaselineDetectorTest(unittest.TestCase):
                 "--benchmark", "--thresholds", "2.0", "4.0",
             ])
         self.assertIn("Benchmark (airflow_blocked", out.getvalue())
+
+    def test_check_model_compatibility_reports_missing_features_and_unseen_groups(self):
+        self.seed_experiment()
+        model_path = self.db.with_name("check_model.json")
+        detect_anomalies(self.db, baseline_label="normal", since=11000, save_model=model_path)
+        compat = check_model_compatibility(self.db, model_path)
+        self.assertTrue(compat["compatible"])
+        self.assertEqual(compat["missing_features"], [])
+
+        other_db = self.db.with_name("other_empty.db")
+        with Storage(other_db, SCHEMA) as other:
+            other.ensure_columns(["unrelated"])
+        incompat = check_model_compatibility(other_db, model_path)
+        self.assertFalse(incompat["compatible"])
+        self.assertEqual(set(incompat["missing_features"]), {"temp_c", "fan_rpm"})
 
 
 if __name__ == "__main__":

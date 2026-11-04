@@ -13,7 +13,7 @@ import json
 import pathlib
 import sqlite3
 
-from .analyze import audit_labels, check_physical_bounds
+from .analyze import analyze_dataset, audit_labels, check_physical_bounds
 from .backup import verify_database
 from .database import resolve_last_minutes
 from .report import dataset_report
@@ -26,11 +26,21 @@ def campaign_summary(
     since: int | None = None,
     until: int | None = None,
 ) -> dict:
-    """Agrège les indicateurs clés d'intégrité et de qualité de la base."""
+    """Agrège les indicateurs clés d'intégrité, de qualité et de projection disque."""
     integrity = verify_database(db)
     rep = dataset_report(db, boot_id=boot_id, since=since, until=until)
+    ana = analyze_dataset(db, boot_id=boot_id, since=since, until=until)
     bounds = check_physical_bounds(db, boot_id=boot_id, since=since, until=until)
     labels = audit_labels(db, boot_id=boot_id, since=since, until=until)
+
+    medians = [b["median_dt_ms"] for b in ana["cadence"] if b["median_dt_ms"] and b["median_dt_ms"] > 0]
+    median_dt_ms = (sum(medians) / len(medians)) if medians else None
+    bps = integrity["size"]["bytes_per_sample"]
+    mib_per_day = None
+    if median_dt_ms is not None and bps is not None:
+        samples_per_day = 86_400_000.0 / median_dt_ms
+        mib_per_day = (samples_per_day * bps) / (1024.0 * 1024.0)
+
     healthy = (
         integrity["ok"]
         and bounds["total_violations"] == 0
@@ -43,6 +53,13 @@ def campaign_summary(
         "boots": len(rep["boots"]),
         "metrics_count": len(rep["metrics"]),
         "events_total": sum(e["count"] for e in rep["events"]),
+        "storage_projection": {
+            "median_dt_ms": median_dt_ms,
+            "bytes_per_sample": bps,
+            "estimated_mib_per_day": mib_per_day,
+            "estimated_mib_14d": None if mib_per_day is None else mib_per_day * 14.0,
+            "estimated_mib_30d": None if mib_per_day is None else mib_per_day * 30.0,
+        },
         "physical_bounds": {
             "checked_metrics": bounds["checked_metrics"],
             "total_violations": bounds["total_violations"],
@@ -86,6 +103,12 @@ def main(argv: Sequence[str] | None = None) -> None:
           f"({result['labels_audit']['open_windows']} ouv., {result['labels_audit']['cross_label_overlap_samples']} multi-labels)")
     print(f"Bornes      : {result['physical_bounds']['total_violations']} violation(s) sur "
           f"{result['physical_bounds']['checked_metrics']} sonde(s)")
+    proj = result["storage_projection"]
+    if proj["estimated_mib_per_day"] is not None:
+        print(
+            f"Projection  : ~{proj['estimated_mib_per_day']:.1f} MiB/j "
+            f"(~{proj['estimated_mib_14d']:.0f} MiB / 14 j)"
+        )
     print(f"Événements  : {result['events_total']}")
 
 

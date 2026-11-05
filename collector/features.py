@@ -63,12 +63,15 @@ def export_features(
     since: int | None = None,
     until: int | None = None,
     columns: Sequence[str] | None = None,
+    exclude_columns: Sequence[str] | None = None,
     rolling: int | None = None,
     deltas: bool = False,
     decode_throttle: bool = False,
     split_ratios: tuple[float, float, float] | None = None,
 ) -> int:
     """Exporte mesures + features dérivées + labels en flux depuis un snapshot lecture seule."""
+    if columns is not None and exclude_columns is not None:
+        raise ValueError("--columns et --exclude-columns sont mutuellement exclusifs")
     if fmt not in ("csv", "jsonl"):
         raise ValueError(f"format non supporté: {fmt!r}")
     if rolling is not None and rolling < 2:
@@ -99,7 +102,10 @@ def export_features(
             if field[1] not in ("sample_id", "ts", "boot_id") and (field[2] or "").upper() != "TEXT"
         ]
         if columns is None:
-            selected_metrics = numeric_cols
+            excluded = set(exclude_columns or ())
+            selected_metrics = [c for c in numeric_cols if c not in excluded]
+            if not selected_metrics and excluded:
+                raise ValueError("toutes les colonnes numériques ont été exclues")
         else:
             selected_metrics = list(columns)
             if not selected_metrics:
@@ -249,6 +255,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--until", type=int, help="epoch ms exclusif")
     parser.add_argument("--last-minutes", type=float, help="limiter aux N dernières minutes")
     parser.add_argument("--columns", nargs="+", help="métriques numériques à inclure")
+    parser.add_argument("--exclude-columns", nargs="+", help="métriques numériques à exclure")
     parser.add_argument("--rolling", type=int, help="taille de fenêtre glissante (moyenne + écart-type)")
     parser.add_argument("--deltas", action="store_true", help="ajouter delta et vitesse par seconde")
     parser.add_argument("--decode-throttle", action="store_true",
@@ -262,6 +269,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             count = export_features(
                 args.db, target, fmt=args.format, boot_id=args.boot_id,
                 since=since, until=until, columns=args.columns,
+                exclude_columns=args.exclude_columns,
                 rolling=args.rolling, deltas=args.deltas,
                 decode_throttle=args.decode_throttle,
                 split_ratios=tuple(args.split_ratios) if args.split_ratios else None,

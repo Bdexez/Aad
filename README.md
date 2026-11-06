@@ -91,8 +91,12 @@ python -m collector.analyze --db data/metrics.db --drift --slices 2
 python -m collector.analyze --db data/metrics.db --by is_gaming
 python -m collector.analyze --db data/metrics.db --check-bounds
 python -m collector.analyze --db data/metrics.db --stuck-runs --min-run 30
+python -m collector.analyze --db data/metrics.db --missing-blocks --min-missing 5
 python -m collector.analyze --db data/metrics.db --changepoints k10temp_tctl --window 30
+python -m collector.analyze --db data/metrics.db --lag-correlate k10temp_tctl rapl_pkg_watts --max-lag 10
+python -m collector.analyze --db data/metrics.db --collinear --r-threshold 0.95
 python -m collector.analyze --db data/metrics.db --check-labels
+python -m collector.summary --db data/metrics.db --json
 python -m collector.html_report --db data/metrics.db --baseline-label normal --output data/report.html
 python -m collector.analyze --db data/metrics.db --last-minutes 60 --json
 ```
@@ -108,6 +112,8 @@ python -m collector.detector --db data/metrics.db --baseline-label normal --sinc
 python -m collector.detector --db data/metrics.db --baseline-label normal --control-for cpu_util --group-by is_gaming --save-model baseline.json
 python -m collector.detector --db data/metrics.db --load-model baseline.json --eval-label airflow_blocked --json
 python -m collector.detector --db data/metrics.db --baseline-label normal --group-by is_gaming --eval-label airflow_blocked --tune-threshold
+python -m collector.detector --db data/metrics.db --baseline-label normal --control-for cpu_util --group-by is_gaming --eval-label airflow_blocked --benchmark
+python -m collector.detector --load-model baseline.json --inspect-model
 ```
 
 The detector fits a robust per-metric baseline (median/MAD with sample-std fallback, skipping constant sensors), optionally conditioned on a workload/context metric (`--control-for`) via linear-regression residuals so high temperatures under heavy load remain normal while elevated temperatures at idle are flagged. It streams target samples from a read-only snapshot, groups consecutive excursions (`--threshold`, `--min-samples`) into episodes annotated with top contributing sensors and nearby kernel/hardware events (`--event-margin-ms`), supports JSON model persistence (`--save-model`/`--load-model`), reports precision/recall/F1 against `--eval-label`, and calibrates optimal thresholds via `--tune-threshold`.
@@ -190,6 +196,7 @@ The suite exercises fake `/proc` and `/sys` trees, sensor discovery, counter wra
 | [`collector/export.py`](collector/export.py) | Read-only CSV/JSONL, downsampled and events export |
 | [`collector/features.py`](collector/features.py) | Streaming ML feature engineering (deltas, rolling stats, throttle flags) |
 | [`collector/report.py`](collector/report.py) | Dataset completeness and annotation coverage |
+| [`collector/summary.py`](collector/summary.py) | One-command campaign health, integrity and storage growth projection |
 | [`collector/html_report.py`](collector/html_report.py) | Standalone offline HTML campaign report with SVG sparklines |
 | [`collector/analyze.py`](collector/analyze.py) | Exploratory statistics, cadence, drift, outliers and label audits |
 | [`collector/detector.py`](collector/detector.py) | Zero-dependency explainable baseline anomaly detector |

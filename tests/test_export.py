@@ -194,3 +194,13 @@ class ExportTest(unittest.TestCase):
             export_downsampled(self.db, io.StringIO(), bucket_ms=0)
         with self.assertRaises(ValueError):
             export_downsampled(self.db, io.StringIO(), bucket_ms=1000, columns=["note"])
+
+    def test_exclude_columns_works_in_csv_and_jsonl_and_rejects_conflict(self):
+        self.storage.insert_samples([{"ts": 100, "boot_id": "a", "temperature": 42.5, "note": "ok"}])
+        out = io.StringIO()
+        export_jsonl(self.db, out, exclude_columns=["note"])
+        rec = json.loads(out.getvalue().splitlines()[0])
+        self.assertIn("temperature", rec)
+        self.assertNotIn("note", rec)
+        with self.assertRaises(ValueError):
+            export_csv(self.db, io.StringIO(), columns=["ts"], exclude_columns=["note"])

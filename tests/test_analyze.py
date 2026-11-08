@@ -19,6 +19,7 @@ from collector.analyze import (
     compare_labels,
     correlate_metric,
     detect_changepoints,
+    detect_clipping,
     detect_collinearity,
     detect_missing_blocks,
     detect_outliers,
@@ -464,6 +465,21 @@ class AnalyzeDatasetTest(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as out:
             analyze_module.main(["--db", str(self.db), "--lag-correlate", "temp_c", "power_w", "--max-lag", "4"])
         self.assertIn("meilleur lag=2", out.getvalue())
+
+    def test_detect_clipping_flags_sensors_pinned_at_ceiling_and_ignores_constants(self):
+        # temp_c plafonne à 95°C sur 50 % des ticks ; stuck est constante (ignorée).
+        values = [50.0, 60.0, 70.0, 80.0, 90.0, 95.0, 95.0, 95.0, 95.0, 95.0]
+        self.storage.insert_samples([
+            {"ts": 1000 * (i + 1), "boot_id": "a", "temp_c": v, "stuck": 5.0}
+            for i, v in enumerate(values)
+        ])
+        res = detect_clipping(self.db, min_pct=40.0)
+        self.assertEqual([m["column"] for m in res["clipped_metrics"]], ["temp_c"])
+        self.assertAlmostEqual(res["clipped_metrics"][0]["at_max_pct"], 50.0)
+
+        with redirect_stdout(io.StringIO()) as out:
+            analyze_module.main(["--db", str(self.db), "--clipping", "--clip-pct", "40"])
+        self.assertIn("50.0 %", out.getvalue())
 
 
 if __name__ == "__main__":

@@ -1312,6 +1312,92 @@ def lag_correlate(
     }
 
 
+def detect_clipping(
+    db: str | pathlib.Path,
+    *,
+    boot_id: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+    min_pct: float = 10.0,
+    columns: Sequence[str] | None = None,
+) -> dict:
+    """Détecte les sondes saturées (valeurs empilées exactement au min ou au max).
+
+    Calculé en deux passes SQLite (O(1) mémoire). Ignore les sondes constantes
+    (`min == max`, déjà signalées par `is_constant`). Utile pour repérer un
+    plafonnement thermique (TjMax), une limite PPT ou un ventilateur bloqué à 100 %.
+    """
+    if not math.isfinite(min_pct) or not (0.0 < min_pct <= 100.0):
+        raise ValueError("--clip-pct doit être dans ]0, 100]")
+    validate_time_range(since, until)
+    where, params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
+    with read_snapshot(db) as conn:
+        metrics, _ = _numeric_metrics(conn)
+        numeric_names = [name for name, _ in metrics]
+        if columns is not None:
+            selected = list(columns)
+            if not selected:
+                raise ValueError("aucune colonne sélectionnée")
+            unknown = set(selected) - set(numeric_names)
+            if unknown:
+                raise ValueError(f"métriques numériques introuvables: {', '.join(sorted(unknown))}")
+        else:
+            selected = numeric_names
+
+        clipped: list[dict] = []
+        if selected:
+            p1_exprs = []
+            for col in selected:
+                qc = quote_identifier(col)
+                p1_exprs.append(f"COUNT({qc}), MIN({qc}), MAX({qc})")
+            p1_row = conn.execute(
+                "SELECT " + ", ".join(p1_exprs) + " FROM samples AS s" + where, params
+            ).fetchone()
+
+            non_const: list[tuple[str, int, float, float]] = []
+            p2_exprs = []
+            p2_params: list[float] = []
+            for idx, col in enumerate(selected):
+                n, lo, hi = p1_row[idx * 3 : (idx + 1) * 3]
+                if n >= 2 and lo is not None and hi is not None and lo < hi:
+                    qc = quote_identifier(col)
+                    non_const.append((col, n, lo, hi))
+                    p2_exprs.append(
+                        f"COUNT(CASE WHEN {qc} = ? THEN 1 END),"
+                        f" COUNT(CASE WHEN {qc} = ? THEN 1 END)"
+                    )
+                    p2_params.extend((lo, hi))
+
+            if non_const:
+                p2_row = conn.execute(
+                    "SELECT " + ", ".join(p2_exprs) + " FROM samples AS s" + where,
+                    [*p2_params, *params],
+                ).fetchone()
+                for idx, (col, n, lo, hi) in enumerate(non_const):
+                    at_min, at_max = p2_row[idx * 2 : (idx + 1) * 2]
+                    pct_min = at_min / n * 100.0
+                    pct_max = at_max / n * 100.0
+                    if pct_min >= min_pct or pct_max >= min_pct:
+                        clipped.append({
+                            "column": col,
+                            "present": n,
+                            "min": lo,
+                            "max": hi,
+                            "at_min_count": at_min,
+                            "at_min_pct": pct_min,
+                            "at_max_count": at_max,
+                            "at_max_pct": pct_max,
+                        })
+                clipped.sort(key=lambda item: (-max(item["at_min_pct"], item["at_max_pct"]), item["column"]))
+
+    return {
+        "boot_id": boot_id,
+        "window": {"since": since, "until": until},
+        "min_pct": min_pct,
+        "clipped_metrics": clipped,
+    }
+
+
 def _fmt(value: float | None, digits: int = 2) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
 
@@ -1376,7 +1462,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="longueur minimale d'une coupure NULL pour --missing-blocks (défaut : 5)")
     parser.add_argument("--max-lag", type=int, default=10,
                         help="décalage maximal en ticks pour --lag-correlate (défaut : 10)")
-    parser.add_argument("--columns", nargs="+", help="sous-ensemble de métriques (pour --outliers, --by, --stuck-runs, --collinear, --missing-blocks)")
+    parser.add_argument("--clip-pct", type=float, default=10.0,
+                        help="pourcentage minimal au min/max pour --clipping (défaut : 10.0)")
+    parser.add_argument("--columns", nargs="+", help="sous-ensemble de métriques (pour --outliers, --by, --stuck-runs, --collinear, --missing-blocks, --clipping)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--compare", nargs=2, metavar=("BASELINE", "TARGET"),
                       help="comparer les métriques numériques entre deux labels")
@@ -1402,6 +1490,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                       help="détecter les coupures contiguës de valeurs NULL par métrique")
     mode.add_argument("--lag-correlate", nargs=2, metavar=("TARGET", "SOURCE"),
                       help="corrélation croisée décalée source[t-lag] -> target[t]")
+    mode.add_argument("--clipping", action="store_true",
+                      help="détecter les sondes saturées sur leur min ou max observé")
     output_fmt = parser.add_mutually_exclusive_group()
     output_fmt.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
     output_fmt.add_argument("--markdown", action="store_true",
@@ -1410,7 +1500,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.markdown and any((
         args.compare, args.correlate, args.outliers, args.check_labels,
         args.drift, args.by, args.check_bounds, args.stuck_runs, args.changepoints,
-        args.collinear, args.missing_blocks, args.lag_correlate,
+        args.collinear, args.missing_blocks, args.lag_correlate, args.clipping,
     )):
         parser.error("--markdown s'applique uniquement au mode exploratoire par défaut")
 
@@ -1476,6 +1566,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 boot_id=args.boot_id, since=since, until=until,
                 max_lag=args.max_lag, min_pairs=args.min_pairs,
             )
+        elif args.clipping:
+            result = detect_clipping(
+                args.db, boot_id=args.boot_id, since=since, until=until,
+                min_pct=args.clip_pct, columns=args.columns,
+            )
         else:
             result = analyze_dataset(
                 args.db, boot_id=args.boot_id, since=since,
@@ -1490,6 +1585,15 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.markdown:
         print(format_markdown(result))
+        return
+
+    if args.clipping:
+        print(f"Saturation / clipping (>= {result['min_pct']:.1f} % au min ou au max) :")
+        for item in result["clipped_metrics"]:
+            print(
+                f"  {item['column']} : min={_fmt(item['min'])} ({item['at_min_pct']:.1f} %), "
+                f"max={_fmt(item['max'])} ({item['at_max_pct']:.1f} %)"
+            )
         return
 
     if args.lag_correlate:

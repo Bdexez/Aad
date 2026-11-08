@@ -392,6 +392,15 @@ class BaselineDetectorTest(unittest.TestCase):
         )
         self.assertEqual(res_excl["baseline"]["features_used"], 1)
 
+        curve_csv = self.db.with_name("curve.csv")
+        tune_threshold(
+            self.db, baseline_label="normal", since=11000, eval_label="airflow_blocked",
+            thresholds=[2.0, 4.0], min_samples=3, export_curve=curve_csv,
+        )
+        lines = curve_csv.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertTrue(lines[0].startswith("threshold,episodes,tp,fp,fn,tn,tpr,fpr,precision,recall,f1"))
+
 
 if __name__ == "__main__":
     unittest.main()

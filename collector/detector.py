@@ -752,6 +752,7 @@ def tune_threshold(
     thresholds: Sequence[float] | None = None,
     min_samples: int = 3,
     load_model: str | pathlib.Path | None = None,
+    export_curve: str | pathlib.Path | None = None,
 ) -> dict:
     """Évalue une grille de seuils z en une passe et sélectionne le meilleur F1."""
     if score_mode not in ("max", "rms"):
@@ -884,6 +885,24 @@ def tune_threshold(
         ),
     )
     roc_auc, pr_auc = _roc_pr_auc([(s, p) for _, s, p in scored if s is not None])
+    if export_curve is not None:
+        curve_path = pathlib.Path(export_curve)
+        stream = curve_path.open("x", encoding="utf-8", newline="")
+        try:
+            with stream:
+                writer = csv.writer(stream, lineterminator="\n")
+                writer.writerow(["threshold", "episodes", "tp", "fp", "fn", "tn", "tpr", "fpr", "precision", "recall", "f1"])
+                for r in results:
+                    tpr = r["tp"] / (r["tp"] + r["fn"]) if (r["tp"] + r["fn"]) else None
+                    fpr = r["fp"] / (r["fp"] + r["tn"]) if (r["fp"] + r["tn"]) else None
+                    fmt_opt = lambda v: "" if v is None else f"{v:.6f}"
+                    writer.writerow([
+                        r["threshold"], r["episodes"], r["tp"], r["fp"], r["fn"], r["tn"],
+                        fmt_opt(tpr), fmt_opt(fpr), fmt_opt(r["precision"]), fmt_opt(r["recall"]), fmt_opt(r["f1"]),
+                    ])
+        except BaseException:
+            curve_path.unlink(missing_ok=True)
+            raise
     return {
         "eval_label": eval_label,
         "samples": len(scored),
@@ -1073,6 +1092,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--load-model", type=pathlib.Path, help="charger un modèle JSON existant")
     parser.add_argument("--export-scores", type=pathlib.Path,
                         help="exporter les scores d'anomalie par échantillon en CSV")
+    parser.add_argument("--export-curve", type=pathlib.Path,
+                        help="exporter la courbe ROC/PR par seuil en CSV (avec --tune-threshold)")
     parser.add_argument("--tune-threshold", action="store_true",
                         help="calibrer le seuil optimal (F1) sur --eval-label")
     parser.add_argument("--benchmark", action="store_true",
@@ -1149,6 +1170,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 thresholds=args.thresholds,
                 min_samples=args.min_samples,
                 load_model=args.load_model,
+                export_curve=args.export_curve,
             )
         else:
             result = detect_anomalies(

@@ -408,6 +408,11 @@ class BaselineDetectorTest(unittest.TestCase):
         )
         self.assertEqual(smoothed["smooth"], 3)
         self.assertEqual(len(smoothed["episodes"]), 1)
+        tuned_smooth = tune_threshold(
+            self.db, baseline_label="normal", since=11000, eval_label="airflow_blocked",
+            smooth=2, thresholds=[2.0, 4.0], min_samples=3,
+        )
+        self.assertIsNotNone(tuned_smooth["best"]["f1"])
         with self.assertRaises(ValueError):
             detect_anomalies(self.db, baseline_label="normal", smooth=0)
 

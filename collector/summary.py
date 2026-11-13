@@ -74,6 +74,31 @@ def campaign_summary(
     }
 
 
+def format_summary_markdown(result: dict) -> str:
+    verdict = "OK" if result["healthy"] else "ATTENTION"
+    size_kb = result["integrity"]["size"]["total_bytes"] / 1024.0
+    samples = result["samples"]
+    cov = "indéfinie" if samples["labelled_pct"] is None else f"{samples['labelled_pct']:.1f} %"
+    proj = result["storage_projection"]
+    proj_str = (
+        f"~{proj['estimated_mib_per_day']:.1f} MiB/j (~{proj['estimated_mib_14d']:.0f} MiB / 14 j)"
+        if proj["estimated_mib_per_day"] is not None
+        else "n/a"
+    )
+    return "\n".join([
+        f"# Synthèse AAD — {verdict}",
+        "",
+        "| Indicateur | Valeur |",
+        "| :--- | :--- |",
+        f"| Intégrité | `{result['integrity']['quick_check']}` ({size_kb:.1f} KiB, `{result['integrity']['journal_mode']}`) |",
+        f"| Mesures | {samples['count']} sur {result['boots']} boot(s) ({result['metrics_count']} métriques) |",
+        f"| Annotations | {cov} · {result['labels_audit']['total_windows']} fenêtre(s) ({result['labels_audit']['open_windows']} ouv.) |",
+        f"| Bornes physiques | {result['physical_bounds']['total_violations']} violation(s) sur {result['physical_bounds']['checked_metrics']} sonde(s) |",
+        f"| Projection disque | {proj_str} |",
+        f"| Événements | {result['events_total']} |",
+    ])
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Synthèse de santé globale d'une base AAD")
     parser.add_argument("--db", default="data/metrics.db", help="base SQLite existante")
@@ -81,7 +106,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--since", type=int, help="epoch ms inclusif")
     parser.add_argument("--until", type=int, help="epoch ms exclusif")
     parser.add_argument("--last-minutes", type=float, help="limiter aux N dernières minutes")
-    parser.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
+    fmt = parser.add_mutually_exclusive_group()
+    fmt.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
+    fmt.add_argument("--markdown", action="store_true", help="sortie Markdown GFM")
     args = parser.parse_args(argv)
     try:
         since, until = resolve_last_minutes(args.last_minutes, args.since, args.until)
@@ -91,6 +118,10 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.markdown:
+        print(format_summary_markdown(result))
         return
 
     verdict = "OK" if result["healthy"] else "ATTENTION"

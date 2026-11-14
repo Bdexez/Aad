@@ -1541,6 +1541,92 @@ def compare_boots(
     }
 
 
+def event_impact(
+    db: str | pathlib.Path,
+    kind: str,
+    *,
+    window_ms: int = 30_000,
+    boot_id: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+) -> dict:
+    """Compare les métriques juste avant [t-W, t) vs juste après [t, t+W) un genre d'événement."""
+    kind = kind.strip()
+    if not kind:
+        raise ValueError("--event-impact ne peut pas être vide")
+    if window_ms <= 0:
+        raise ValueError("--impact-window-ms doit être > 0")
+    validate_time_range(since, until)
+    base_where, base_params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
+    prefix = (base_where + " AND ") if base_where else " WHERE "
+
+    ev_filters = ["e.kind = ?"]
+    ev_params: list[str | int] = [kind]
+    if since is not None:
+        ev_filters.append("e.ts >= ?")
+        ev_params.append(since)
+    if until is not None:
+        ev_filters.append("e.ts < ?")
+        ev_params.append(until)
+    ev_cond = " AND ".join(ev_filters)
+
+    before_where = (
+        prefix + f"EXISTS (SELECT 1 FROM events AS e WHERE {ev_cond}"
+        " AND s.ts >= e.ts - ? AND s.ts < e.ts)"
+    )
+    after_where = (
+        prefix + f"EXISTS (SELECT 1 FROM events AS e WHERE {ev_cond}"
+        " AND s.ts >= e.ts AND s.ts < e.ts + ?)"
+    )
+    before_params = [*base_params, *ev_params, window_ms]
+    after_params = [*base_params, *ev_params, window_ms]
+
+    with read_snapshot(db) as conn:
+        metrics, _ = _numeric_metrics(conn)
+        events_found = conn.execute(
+            f"SELECT COUNT(*) FROM events AS e WHERE {ev_cond}", ev_params
+        ).fetchone()[0]
+        before_count = conn.execute(
+            "SELECT COUNT(*) FROM samples AS s" + before_where, before_params
+        ).fetchone()[0]
+        after_count = conn.execute(
+            "SELECT COUNT(*) FROM samples AS s" + after_where, after_params
+        ).fetchone()[0]
+        before_stats = _compute_numeric_stats(conn, metrics, before_count, before_where, before_params)
+        after_stats = _compute_numeric_stats(conn, metrics, after_count, after_where, after_params)
+
+    diffs = []
+    for before, after in zip(before_stats, after_stats):
+        b_mean, b_std = before["mean"], before["std"]
+        a_mean, a_std = after["mean"], after["std"]
+        delta = None if b_mean is None or a_mean is None else a_mean - b_mean
+        z_shift = None if delta is None or b_std is None or b_std == 0.0 else delta / b_std
+        diffs.append({
+            "column": before["column"],
+            "before_present": before["present"],
+            "before_mean": b_mean,
+            "before_std": b_std,
+            "after_present": after["present"],
+            "after_mean": a_mean,
+            "after_std": a_std,
+            "delta_mean": delta,
+            "z_shift": z_shift,
+        })
+    diffs.sort(
+        key=lambda item: (item["z_shift"] is None, -(abs(item["z_shift"]) if item["z_shift"] is not None else 0.0), item["column"])
+    )
+    return {
+        "boot_id": boot_id,
+        "window": {"since": since, "until": until},
+        "kind": kind,
+        "window_ms": window_ms,
+        "events_found": events_found,
+        "before_samples": before_count,
+        "after_samples": after_count,
+        "metrics": diffs,
+    }
+
+
 def _fmt(value: float | None, digits: int = 2) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
 
@@ -1607,6 +1693,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="décalage maximal en ticks pour --lag-correlate (défaut : 10)")
     parser.add_argument("--clip-pct", type=float, default=10.0,
                         help="pourcentage minimal au min/max pour --clipping (défaut : 10.0)")
+    parser.add_argument("--impact-window-ms", type=int, default=30_000,
+                        help="demi-fenêtre avant/après en ms pour --event-impact (défaut : 30000)")
     parser.add_argument("--columns", nargs="+", help="sous-ensemble de métriques (pour --outliers, --by, --stuck-runs, --collinear, --missing-blocks, --clipping)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--compare", nargs=2, metavar=("BASELINE", "TARGET"),
@@ -1639,6 +1727,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                       help="estimer la résistance thermique effective R_th (°C/W) par boot")
     mode.add_argument("--compare-boots", nargs=2, metavar=("BOOT_A", "BOOT_B"),
                       help="comparer les métriques numériques entre deux boots")
+    mode.add_argument("--event-impact", metavar="KIND",
+                      help="comparer les métriques avant vs après les événements d'un genre donné")
     output_fmt = parser.add_mutually_exclusive_group()
     output_fmt.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
     output_fmt.add_argument("--markdown", action="store_true",
@@ -1648,7 +1738,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.compare, args.correlate, args.outliers, args.check_labels,
         args.drift, args.by, args.check_bounds, args.stuck_runs, args.changepoints,
         args.collinear, args.missing_blocks, args.lag_correlate, args.clipping,
-        args.thermal_profile, args.compare_boots,
+        args.thermal_profile, args.compare_boots, args.event_impact,
     )):
         parser.error("--markdown s'applique uniquement au mode exploratoire par défaut")
 
@@ -1729,6 +1819,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.db, args.compare_boots[0], args.compare_boots[1],
                 since=since, until=until,
             )
+        elif args.event_impact:
+            result = event_impact(
+                args.db, args.event_impact, window_ms=args.impact_window_ms,
+                boot_id=args.boot_id, since=since, until=until,
+            )
         else:
             result = analyze_dataset(
                 args.db, boot_id=args.boot_id, since=since,
@@ -1743,6 +1838,18 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.markdown:
         print(format_markdown(result))
+        return
+
+    if args.event_impact:
+        print(
+            f"Impact de {result['kind']} ({result['events_found']} événement(s), "
+            f"±{result['window_ms']} ms : {result['before_samples']} → {result['after_samples']} mesures) :"
+        )
+        for item in result["metrics"]:
+            print(
+                f"  {item['column']} : {_fmt(item['before_mean'])} → {_fmt(item['after_mean'])} "
+                f"(Δ={_fmt(item['delta_mean'])}, z={_fmt(item['z_shift'])})"
+            )
         return
 
     if args.thermal_profile:

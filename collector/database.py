@@ -34,6 +34,32 @@ def resolve_last_minutes(
     return now - int(last_minutes * 60_000), None
 
 
+def resolve_boot_id(
+    db: str | pathlib.Path,
+    *,
+    boot_id: str | None = None,
+    latest_boot: bool = False,
+) -> str | None:
+    """Résout `--latest-boot` vers le boot le plus récent (ou valide l'exclusivité avec `--boot`)."""
+    if not latest_boot:
+        return boot_id
+    if boot_id is not None:
+        raise ValueError("--latest-boot ne se combine pas avec --boot")
+    with read_snapshot(db) as conn:
+        row = conn.execute(
+            "SELECT boot_id FROM samples GROUP BY boot_id ORDER BY MAX(ts) DESC, boot_id DESC LIMIT 1"
+        ).fetchone()
+        if row is not None:
+            return str(row[0])
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'boots'").fetchone():
+            row = conn.execute(
+                "SELECT boot_id FROM boots ORDER BY ts_first DESC, boot_id DESC LIMIT 1"
+            ).fetchone()
+            if row is not None:
+                return str(row[0])
+    raise ValueError("aucun boot enregistré dans la base")
+
+
 def sample_filter_sql(
     *,
     boot_id: str | None = None,

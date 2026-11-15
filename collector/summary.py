@@ -15,7 +15,7 @@ import sqlite3
 
 from .analyze import analyze_dataset, audit_labels, check_physical_bounds
 from .backup import verify_database
-from .database import resolve_last_minutes
+from .database import resolve_boot_id, resolve_last_minutes
 from .report import dataset_report
 
 
@@ -103,6 +103,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Synthèse de santé globale d'une base AAD")
     parser.add_argument("--db", default="data/metrics.db", help="base SQLite existante")
     parser.add_argument("--boot", dest="boot_id", help="limiter à un boot_id")
+    parser.add_argument("--latest-boot", action="store_true", help="limiter au boot le plus récent")
     parser.add_argument("--since", type=int, help="epoch ms inclusif")
     parser.add_argument("--until", type=int, help="epoch ms exclusif")
     parser.add_argument("--last-minutes", type=float, help="limiter aux N dernières minutes")
@@ -111,8 +112,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     fmt.add_argument("--markdown", action="store_true", help="sortie Markdown GFM")
     args = parser.parse_args(argv)
     try:
+        boot_id = resolve_boot_id(args.db, boot_id=args.boot_id, latest_boot=args.latest_boot)
         since, until = resolve_last_minutes(args.last_minutes, args.since, args.until)
-        result = campaign_summary(args.db, boot_id=args.boot_id, since=since, until=until)
+        result = campaign_summary(args.db, boot_id=boot_id, since=since, until=until)
     except (ValueError, OSError, sqlite3.Error) as exc:
         parser.error(f"synthèse impossible: {exc}")
 

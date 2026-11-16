@@ -12,6 +12,7 @@ import unittest
 from collector import analyze as analyze_module
 from collector.analyze import (
     analyze_by_group,
+    analyze_core_skew,
     analyze_dataset,
     analyze_drift,
     audit_labels,
@@ -533,6 +534,23 @@ class AnalyzeDatasetTest(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as out:
             analyze_module.main(["--db", str(self.db), "--event-impact", "thermal_trip", "--impact-window-ms", "5000"])
         self.assertIn("Impact de thermal_trip", out.getvalue())
+
+    def test_analyze_core_skew_detects_single_core_asymmetry(self):
+        self.storage.ensure_columns(["cpu0_util", "cpu1_util", "cpu2_util"])
+        self.storage.insert_samples([
+            {"ts": 1000, "boot_id": "a", "cpu0_util": 0.2, "cpu1_util": 0.25, "cpu2_util": 0.2},
+            {"ts": 2000, "boot_id": "a", "cpu0_util": 0.95, "cpu1_util": 0.1, "cpu2_util": 0.15},
+            {"ts": 3000, "boot_id": "a", "cpu0_util": 0.9, "cpu1_util": 0.1, "cpu2_util": 0.2},
+        ])
+        res = analyze_core_skew(self.db, skew_threshold=0.5)
+        self.assertEqual(res["cores_found"], 3)
+        self.assertEqual(res["skewed_samples"], 2)
+        self.assertEqual(res["cores"][0]["hottest_in_skewed"], 2)
+        self.assertEqual(res["cores"][1]["coldest_in_skewed"], 2)
+
+        with redirect_stdout(io.StringIO()) as out:
+            analyze_module.main(["--db", str(self.db), "--core-skew"])
+        self.assertIn("Asymétrie inter-cœurs", out.getvalue())
 
 
 if __name__ == "__main__":

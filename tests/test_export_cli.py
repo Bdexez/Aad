@@ -112,3 +112,7 @@ class ExportCliTest(unittest.TestCase):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as err:
             export_module.main(["--db", str(self.db), "--last-minutes", "5", "--since", "0"])
         self.assertEqual(err.exception.code, 2)
+
+        latest_out, _ = self.cli("--latest-boot", "--format", "jsonl")
+        records = [json.loads(line) for line in latest_out.splitlines()]
+        self.assertEqual([r["boot_id"] for r in records], ["b"])

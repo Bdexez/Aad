@@ -416,6 +416,34 @@ class BaselineDetectorTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             detect_anomalies(self.db, baseline_label="normal", smooth=0)
 
+    def test_directional_scoring_and_export_labels_roundtrip_into_storage(self):
+        self.seed_experiment()
+        # Ajouter un épisode froid (20°C) qui doit être ignoré en --direction high
+        self.storage.insert_samples([
+            {"ts": 30000, "boot_id": "c", "temp_c": 20.0, "fan_rpm": 1200.0},
+            {"ts": 31000, "boot_id": "c", "temp_c": 20.0, "fan_rpm": 1200.0},
+            {"ts": 32000, "boot_id": "c", "temp_c": 20.0, "fan_rpm": 1200.0},
+        ])
+        high_only = detect_anomalies(
+            self.db, baseline_label="normal", boot_id="c", direction="high", threshold=4.0, min_samples=3,
+        )
+        self.assertEqual(high_only["episodes"], [])
+        low_only = detect_anomalies(
+            self.db, baseline_label="normal", boot_id="c", direction="low", threshold=4.0, min_samples=3,
+        )
+        self.assertEqual(len(low_only["episodes"]), 1)
+
+        labels_json = self.db.with_name("candidates.json")
+        detect_anomalies(
+            self.db, baseline_label="normal", since=11000, direction="high",
+            threshold=4.0, min_samples=3, export_labels=labels_json, label_name="review_me",
+        )
+        entries = json.loads(labels_json.read_text(encoding="utf-8"))
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["label"], "review_me")
+        inserted, skipped = self.storage.import_labels(entries)
+        self.assertEqual((inserted, skipped), (1, 0))
+
 
 if __name__ == "__main__":
     unittest.main()

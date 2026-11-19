@@ -801,6 +801,7 @@ def tune_threshold(
     control_for: str | None = None,
     group_by: str | None = None,
     score_mode: str = "max",
+    direction: str = "both",
     smooth: int = 1,
     thresholds: Sequence[float] | None = None,
     min_samples: int = 3,
@@ -810,6 +811,8 @@ def tune_threshold(
     """Évalue une grille de seuils z en une passe et sélectionne le meilleur F1."""
     if score_mode not in ("max", "rms"):
         raise ValueError("--score-mode doit valoir 'max' ou 'rms'")
+    if direction not in ("both", "high", "low"):
+        raise ValueError("--direction doit valoir 'both', 'high' ou 'low'")
     if smooth < 1:
         raise ValueError("--smooth doit être >= 1")
     eval_label = eval_label.strip()
@@ -927,10 +930,10 @@ def tune_threshold(
                 else:
                     expected = fb.center
                 z = (val - expected) / fb.scale
-                az = abs(z)
+                az = _directional_mag(z, direction)
                 if az > max_abs:
                     max_abs = az
-                sq_sum += z * z
+                sq_sum += az * az
                 n_obs += 1
             if n_obs > 0:
                 raw_score = math.sqrt(sq_sum / n_obs) if score_mode == "rms" else max_abs
@@ -994,6 +997,7 @@ def benchmark_configs(
     columns: Sequence[str] | None = None,
     control_for: str | None = None,
     group_by: str | None = None,
+    direction: str = "both",
     smooth: int = 1,
     thresholds: Sequence[float] | None = None,
     min_samples: int = 3,
@@ -1025,6 +1029,7 @@ def benchmark_configs(
                 control_for=ctrl,
                 group_by=grp,
                 score_mode=mode,
+                direction=direction,
                 smooth=smooth,
                 thresholds=thresholds,
                 min_samples=min_samples,
@@ -1229,6 +1234,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 columns=args.columns,
                 control_for=args.control_for,
                 group_by=args.group_by,
+                direction=args.direction,
                 smooth=args.smooth,
                 thresholds=args.thresholds,
                 min_samples=args.min_samples,
@@ -1249,6 +1255,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 control_for=args.control_for,
                 group_by=args.group_by,
                 score_mode=args.score_mode,
+                direction=args.direction,
                 smooth=args.smooth,
                 thresholds=args.thresholds,
                 min_samples=args.min_samples,

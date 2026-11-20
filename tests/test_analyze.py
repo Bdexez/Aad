@@ -20,9 +20,11 @@ from collector.analyze import (
     compare_boots,
     compare_labels,
     correlate_metric,
+    describe_schema,
     detect_changepoints,
     detect_clipping,
     detect_collinearity,
+    detect_event_bursts,
     detect_missing_blocks,
     detect_outliers,
     detect_stuck_runs,
@@ -551,6 +553,29 @@ class AnalyzeDatasetTest(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as out:
             analyze_module.main(["--db", str(self.db), "--core-skew"])
         self.assertIn("Asymétrie inter-cœurs", out.getvalue())
+
+    def test_event_bursts_and_describe_schema(self):
+        self.storage.ensure_columns(["cpu_util"])
+        self.storage.insert_samples([{"ts": 1000, "boot_id": "a", "cpu_util": 0.4, "temp_c": 50.0, "note": "ok"}])
+        self.storage.add_event(1000, "collector", "start", "info", "")
+        self.storage.add_event(2000, "kmsg", "mce", "error", "1")
+        self.storage.add_event(3500, "kmsg", "mce", "error", "2")
+        self.storage.add_event(4000, "kmsg", "thermal_trip", "critical", "3")
+        self.storage.add_event(50000, "kmsg", "mce", "error", "isolated")
+
+        bursts = detect_event_bursts(self.db, gap_ms=5000, min_events=2)
+        self.assertEqual(len(bursts["bursts"]), 1)
+        self.assertEqual(bursts["bursts"][0]["count"], 3)
+
+        schema = describe_schema(self.db)
+        by_col = {c["column"]: c for c in schema["columns"]}
+        self.assertEqual(by_col["cpu_util"]["unit"], "ratio [0, 1]")
+        self.assertEqual(by_col["note"]["role"], "text")
+        self.assertEqual(by_col["ts"]["role"], "meta")
+
+        with redirect_stdout(io.StringIO()) as out:
+            analyze_module.main(["--db", str(self.db), "--describe-schema"])
+        self.assertIn("Dictionnaire de données", out.getvalue())
 
 
 if __name__ == "__main__":

@@ -577,6 +577,29 @@ class AnalyzeDatasetTest(unittest.TestCase):
             analyze_module.main(["--db", str(self.db), "--describe-schema"])
         self.assertIn("Dictionnaire de données", out.getvalue())
 
+    def test_spearman_correlation_and_collinearity_capture_monotonic_nonlinear_curve(self):
+        # y = x^3 : relation strictement monotone non linéaire -> Spearman = 1.0, Pearson < 1.0
+        self.storage.ensure_columns(["x", "y"])
+        self.storage.insert_samples([
+            {"ts": 1000 * i, "boot_id": "a", "x": float(i), "y": float(i ** 3)}
+            for i in range(1, 8)
+        ])
+        pearson = correlate_metric(self.db, "x", method="pearson")
+        spearman = correlate_metric(self.db, "x", method="spearman")
+        p_y = next(c for c in pearson["correlations"] if c["column"] == "y")
+        s_y = next(c for c in spearman["correlations"] if c["column"] == "y")
+        self.assertLess(p_y["r"], 0.96)
+        self.assertAlmostEqual(s_y["r"], 1.0)
+        self.assertEqual(spearman["method"], "spearman")
+
+        col = detect_collinearity(self.db, r_threshold=0.99, columns=["x", "y"], method="spearman")
+        self.assertEqual(len(col["collinear_pairs"]), 1)
+        self.assertAlmostEqual(col["collinear_pairs"][0]["r"], 1.0)
+
+        with redirect_stdout(io.StringIO()) as out:
+            analyze_module.main(["--db", str(self.db), "--correlate", "x", "--method", "spearman"])
+        self.assertIn("Corrélations de Spearman", out.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

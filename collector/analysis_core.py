@@ -109,5 +109,45 @@ def _compute_numeric_stats(
     return result
 
 
+def _average_ranks(values: Sequence[float]) -> list[float]:
+    """Calcule les rangs moyens (gestion exacte des ex-aequo) pour Spearman."""
+    n = len(values)
+    order = sorted(range(n), key=values.__getitem__)
+    ranks = [0.0] * n
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and values[order[j]] == values[order[i]]:
+            j += 1
+        avg_rank = (i + j - 1) / 2.0 + 1.0
+        for k in range(i, j):
+            ranks[order[k]] = avg_rank
+        i = j
+    return ranks
+
+
+def _pearson_lists(xs: Sequence[float], ys: Sequence[float]) -> float | None:
+    """Corrélation de Pearson en mémoire sur deux séquences finies de même taille."""
+    n = len(xs)
+    if n < 2:
+        return None
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    sxx = sum((x - mx) ** 2 for x in xs)
+    syy = sum((y - my) ** 2 for y in ys)
+    denom = math.sqrt(max(0.0, sxx) * max(0.0, syy))
+    if denom <= 0.0:
+        return None
+    return max(-1.0, min(1.0, sxy / denom))
+
+
+def _spearman_lists(xs: Sequence[float], ys: Sequence[float]) -> float | None:
+    """Corrélation de rang de Spearman (Pearson sur les rangs moyens)."""
+    if len(xs) < 2:
+        return None
+    return _pearson_lists(_average_ranks(xs), _average_ranks(ys))
+
+
 def _fmt(value: float | None, digits: int = 2) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"

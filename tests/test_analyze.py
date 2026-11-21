@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 from collector import analyze as analyze_module
-from collector.analyze import analyze_dataset, compare_labels, correlate_metric
+from collector.analyze import analyze_dataset, compare_labels, correlate_metric, detect_outliers
 from collector.main import SCHEMA
 from collector.storage import Storage
 
@@ -221,6 +221,34 @@ class AnalyzeDatasetTest(unittest.TestCase):
             analyze_module.main(["--db", str(self.db), "--correlate", "temp_c"])
         self.assertIn("Corrélations de Pearson avec temp_c", out.getvalue())
         self.assertIn("power_w : r=1.000", out.getvalue())
+
+    def test_detect_outliers_flags_extreme_spikes_and_handles_zero_mad(self):
+        values = [48.0, 49.0, 50.0, 50.0, 51.0, 52.0, 50.0, 49.0, 51.0, 120.0]
+        self.storage.insert_samples([
+            {"ts": 1000 * (i + 1), "boot_id": "a", "temp_c": v, "stuck": 5.0}
+            for i, v in enumerate(values)
+        ])
+        res = detect_outliers(self.db)
+        self.assertEqual(res["metrics"][0]["column"], "temp_c")
+        temp = res["metrics"][0]
+        self.assertEqual(temp["present"], 10)
+        self.assertEqual(temp["outlier_count"], 1)
+        self.assertEqual(temp["max_outlier"], 120.0)
+        self.assertAlmostEqual(temp["median"], 50.0)
+        self.assertGreater(temp["mad"], 0.0)
+
+        stuck = res["metrics"][1]
+        self.assertEqual(stuck["mad"], 0.0)
+        self.assertEqual(stuck["outlier_count"], 0)
+
+        with self.assertRaises(ValueError):
+            detect_outliers(self.db, z_threshold=0.0)
+        with self.assertRaises(ValueError):
+            detect_outliers(self.db, columns=["note"])
+
+        with redirect_stdout(io.StringIO()) as out:
+            analyze_module.main(["--db", str(self.db), "--outliers", "--columns", "temp_c"])
+        self.assertIn("outliers=1/10", out.getvalue())
 
 
 if __name__ == "__main__":

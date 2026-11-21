@@ -19,13 +19,15 @@ from .database import read_snapshot, sample_filter_sql, validate_time_range
 from .storage import quote_identifier
 
 _META_COLUMNS = frozenset({"sample_id", "ts", "boot_id"})
+#: Facteur de cohérence normale pour le z-score modifié d'Iglewicz & Hoaglin.
+_MAD_SCALE = 0.6744897501960817
 
 
 def _percentage(part: int, total: int) -> float | None:
     return part / total * 100.0 if total else None
 
 
-def _quantile(sorted_values: list[int], q: float) -> float | None:
+def _quantile(sorted_values: Sequence[int | float], q: float) -> float | None:
     """Quantile par interpolation linéaire (méthode R7, identique à numpy/pandas)."""
     if not sorted_values:
         return None
@@ -441,6 +443,88 @@ def correlate_metric(
     }
 
 
+def detect_outliers(
+    db: str | pathlib.Path,
+    *,
+    boot_id: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+    z_threshold: float = 3.5,
+    columns: Sequence[str] | None = None,
+) -> dict:
+    """Détecte les valeurs atypiques par médiane/MAD (z-score modifié) et IQR.
+
+    Ne modifie ni les mesures ni les labels : signale simplement les sondes qui
+    présentent des pics extrêmes ou des artefacts capteurs avant modélisation.
+    """
+    if not math.isfinite(z_threshold) or z_threshold <= 0:
+        raise ValueError("--z-threshold doit être un nombre fini > 0")
+    validate_time_range(since, until)
+    where, params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
+    prefix = (where + " AND ") if where else " WHERE "
+    with read_snapshot(db) as conn:
+        metrics, _ = _numeric_metrics(conn)
+        numeric_names = [name for name, _ in metrics]
+        if columns is not None:
+            selected = list(columns)
+            if not selected:
+                raise ValueError("aucune colonne spécifiée pour --outliers")
+            unknown = set(selected) - set(numeric_names)
+            if unknown:
+                raise ValueError(f"métriques numériques introuvables: {', '.join(sorted(unknown))}")
+        else:
+            selected = numeric_names
+
+        results: list[dict] = []
+        for col in selected:
+            qc = quote_identifier(col)
+            values = [
+                row[0]
+                for row in conn.execute(
+                    f"SELECT {qc} FROM samples AS s{prefix}{qc} IS NOT NULL ORDER BY {qc}",
+                    params,
+                )
+            ]
+            present = len(values)
+            if not present:
+                results.append({
+                    "column": col, "present": 0, "p25": None, "median": None, "p75": None,
+                    "iqr": None, "mad": None, "outlier_count": 0, "outlier_pct": None,
+                    "min_outlier": None, "max_outlier": None,
+                })
+                continue
+            p25 = _quantile(values, 0.25)
+            median = _quantile(values, 0.50)
+            p75 = _quantile(values, 0.75)
+            iqr = p75 - p25
+            abs_devs = sorted(abs(v - median) for v in values)
+            mad = _quantile(abs_devs, 0.50)
+            if mad is not None and mad > 0.0:
+                outliers = [v for v in values if _MAD_SCALE * abs(v - median) / mad > z_threshold]
+            else:
+                outliers = []
+            results.append({
+                "column": col,
+                "present": present,
+                "p25": p25,
+                "median": median,
+                "p75": p75,
+                "iqr": iqr,
+                "mad": mad,
+                "outlier_count": len(outliers),
+                "outlier_pct": _percentage(len(outliers), present),
+                "min_outlier": outliers[0] if outliers else None,
+                "max_outlier": outliers[-1] if outliers else None,
+            })
+        results.sort(key=lambda item: (-item["outlier_count"], item["column"]))
+    return {
+        "boot_id": boot_id,
+        "window": {"since": since, "until": until},
+        "z_threshold": z_threshold,
+        "metrics": results,
+    }
+
+
 def _fmt(value: float | None, digits: int = 2) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
 
@@ -455,11 +539,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="multiple de la cadence médiane définissant un trou (défaut : 2.0)")
     parser.add_argument("--min-pairs", type=int, default=3,
                         help="paires minimales pour calculer une corrélation (défaut : 3)")
+    parser.add_argument("--z-threshold", type=float, default=3.5,
+                        help="seuil de z-score modifié (MAD) pour --outliers (défaut : 3.5)")
+    parser.add_argument("--columns", nargs="+", help="sous-ensemble de métriques (pour --outliers)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--compare", nargs=2, metavar=("BASELINE", "TARGET"),
                       help="comparer les métriques numériques entre deux labels")
     mode.add_argument("--correlate", metavar="COLUMN",
                       help="corrélations de Pearson entre une métrique cible et les autres sondes")
+    mode.add_argument("--outliers", action="store_true",
+                      help="détecter les valeurs atypiques par médiane/MAD et IQR")
     parser.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
     args = parser.parse_args(argv)
 
@@ -475,6 +564,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 boot_id=args.boot_id, since=args.since, until=args.until,
                 min_pairs=args.min_pairs,
             )
+        elif args.outliers:
+            result = detect_outliers(
+                args.db, boot_id=args.boot_id, since=args.since, until=args.until,
+                z_threshold=args.z_threshold, columns=args.columns,
+            )
         else:
             result = analyze_dataset(
                 args.db, boot_id=args.boot_id, since=args.since,
@@ -485,6 +579,16 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.outliers:
+        print(f"Valeurs atypiques (z-score modifié MAD > {result['z_threshold']}) :")
+        for item in result["metrics"]:
+            print(
+                f"  {item['column']} : médiane={_fmt(item['median'])}, "
+                f"IQR={_fmt(item['iqr'])}, MAD={_fmt(item['mad'])}, "
+                f"outliers={item['outlier_count']}/{item['present']} ({_fmt(item['outlier_pct'], 1)} %)"
+            )
         return
 
     if args.correlate:

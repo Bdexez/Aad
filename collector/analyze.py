@@ -1,0 +1,450 @@
+"""Analyse exploratoire du dataset AAD, en lecture seule sans migration.
+
+Fournit trois diagnostics essentiels avant d'entraîner un modèle d'anomalies :
+- cadence d'échantillonnage par boot (médiane, p95, trous, retours d'horloge) ;
+- statistiques descriptives par métrique numérique (calculées dans SQLite) ;
+- équilibre des classes labellisées et comparaison entre deux expériences.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Sequence
+import json
+import math
+import pathlib
+import sqlite3
+
+from .database import read_snapshot
+from .storage import quote_identifier
+
+_META_COLUMNS = frozenset({"sample_id", "ts", "boot_id"})
+
+
+def _percentage(part: int, total: int) -> float | None:
+    return part / total * 100.0 if total else None
+
+
+def _quantile(sorted_values: list[int], q: float) -> float | None:
+    """Quantile par interpolation linéaire (méthode R7, identique à numpy/pandas)."""
+    if not sorted_values:
+        return None
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    pos = (len(sorted_values) - 1) * q
+    lo = math.floor(pos)
+    hi = math.ceil(pos)
+    if lo == hi:
+        return float(sorted_values[lo])
+    return sorted_values[lo] + (sorted_values[hi] - sorted_values[lo]) * (pos - lo)
+
+
+def _validate_range(since: int | None, until: int | None) -> None:
+    if since is not None and until is not None and until <= since:
+        raise ValueError("--until doit être supérieur à --since")
+
+
+def _sample_filter_sql(
+    boot_id: str | None,
+    since: int | None,
+    until: int | None,
+    alias: str = "",
+) -> tuple[str, list[str | int]]:
+    prefix = f"{alias}." if alias else ""
+    filters: list[str] = []
+    params: list[str | int] = []
+    if boot_id is not None:
+        filters.append(f"{prefix}boot_id = ?")
+        params.append(boot_id)
+    if since is not None:
+        filters.append(f"{prefix}ts >= ?")
+        params.append(since)
+    if until is not None:
+        filters.append(f"{prefix}ts < ?")
+        params.append(until)
+    where = " WHERE " + " AND ".join(filters) if filters else ""
+    return where, params
+
+
+def _numeric_metrics(conn: sqlite3.Connection) -> tuple[list[tuple[str, str]], str]:
+    fields = conn.execute("PRAGMA table_info(samples)").fetchall()
+    names = {field[1] for field in fields}
+    if not {"ts", "boot_id"} <= names:
+        raise ValueError("la base ne contient pas de table samples compatible")
+    order_col = "sample_id" if "sample_id" in names else "ts"
+    metrics = [
+        (field[1], field[2])
+        for field in fields
+        if field[1] not in _META_COLUMNS and (field[2] or "").upper() != "TEXT"
+    ]
+    return metrics, order_col
+
+
+def _compute_numeric_stats(
+    conn: sqlite3.Connection,
+    metrics: list[tuple[str, str]],
+    total_samples: int,
+    where: str,
+    params: Sequence[str | int],
+) -> list[dict]:
+    """Statistiques descriptives en deux passes SQLite (O(1) mémoire Python)."""
+    if not metrics:
+        return []
+    agg_exprs = []
+    for name, _ in metrics:
+        q = quote_identifier(name)
+        agg_exprs.append(f"COUNT({q}), MIN({q}), MAX({q}), AVG({q})")
+    row = conn.execute(
+        "SELECT " + ", ".join(agg_exprs) + " FROM samples AS s" + where,
+        params,
+    ).fetchone()
+
+    pass1: list[tuple[str, str, int, float | None, float | None, float | None]] = []
+    var_exprs: list[str] = []
+    var_params: list[float] = []
+    var_indices: list[int] = []
+    for idx, (name, coltype) in enumerate(metrics):
+        present, minimum, maximum, mean = row[idx * 4 : (idx + 1) * 4]
+        pass1.append((name, coltype, present, minimum, maximum, mean))
+        if present > 1 and mean is not None:
+            q = quote_identifier(name)
+            var_exprs.append(f"SUM(({q} - ?) * ({q} - ?))")
+            var_params.extend((mean, mean))
+            var_indices.append(idx)
+
+    stds: dict[int, float] = {}
+    if var_exprs:
+        sq_row = conn.execute(
+            "SELECT " + ", ".join(var_exprs) + " FROM samples AS s" + where,
+            [*var_params, *params],
+        ).fetchone()
+        for idx, sum_sq in zip(var_indices, sq_row):
+            present = pass1[idx][2]
+            if sum_sq is not None and present > 1:
+                stds[idx] = math.sqrt(max(0.0, sum_sq) / (present - 1))
+
+    result = []
+    for idx, (name, coltype, present, minimum, maximum, mean) in enumerate(pass1):
+        result.append({
+            "column": name,
+            "type": coltype,
+            "present": present,
+            "missing": total_samples - present,
+            "coverage_pct": _percentage(present, total_samples),
+            "min": minimum,
+            "max": maximum,
+            "mean": mean,
+            "std": stds.get(idx),
+            "is_constant": present > 0 and minimum == maximum,
+        })
+    return result
+
+
+def _compute_cadence(
+    conn: sqlite3.Connection,
+    order_col: str,
+    where: str,
+    params: Sequence[str | int],
+    gap_factor: float,
+) -> list[dict]:
+    cursor = conn.execute(
+        f"SELECT s.boot_id, s.ts FROM samples AS s{where}"
+        f" ORDER BY s.boot_id, s.{quote_identifier(order_col)}",
+        params,
+    )
+    boots: list[dict] = []
+    current_boot: str | None = None
+    prev_ts: int | None = None
+    samples = 0
+    duplicates = 0
+    regressions = 0
+    positive_dts: list[int] = []
+
+    def finish_boot() -> None:
+        if current_boot is None:
+            return
+        positive_dts.sort()
+        median_dt = _quantile(positive_dts, 0.5)
+        p95_dt = _quantile(positive_dts, 0.95)
+        gaps = 0
+        if median_dt is not None and median_dt > 0:
+            threshold = gap_factor * median_dt
+            gaps = sum(1 for dt in positive_dts if dt > threshold)
+        boots.append({
+            "boot_id": current_boot,
+            "samples": samples,
+            "intervals": max(0, samples - 1),
+            "min_dt_ms": positive_dts[0] if positive_dts else None,
+            "median_dt_ms": median_dt,
+            "p95_dt_ms": p95_dt,
+            "max_dt_ms": positive_dts[-1] if positive_dts else None,
+            "mean_dt_ms": sum(positive_dts) / len(positive_dts) if positive_dts else None,
+            "duplicate_timestamps": duplicates,
+            "clock_regressions": regressions,
+            "gaps": gaps,
+        })
+
+    for boot, ts in cursor:
+        if boot != current_boot:
+            finish_boot()
+            current_boot = boot
+            prev_ts = ts
+            samples = 1
+            duplicates = 0
+            regressions = 0
+            positive_dts = []
+            continue
+        samples += 1
+        dt = ts - prev_ts
+        if dt == 0:
+            duplicates += 1
+        elif dt < 0:
+            regressions += 1
+        else:
+            positive_dts.append(dt)
+        prev_ts = ts
+
+    finish_boot()
+    return boots
+
+
+def _compute_label_summary(
+    conn: sqlite3.Connection,
+    sample_where: str,
+    sample_params: Sequence[str | int],
+    since: int | None,
+    until: int | None,
+) -> list[dict]:
+    label_filters: list[str] = []
+    time_params: list[int] = []
+    event_filters: list[str] = []
+    if since is not None:
+        label_filters.append("(ts_end IS NULL OR ts_end > ?)")
+        event_filters.append("e.ts >= ?")
+        time_params.append(since)
+    if until is not None:
+        label_filters.append("ts_start < ?")
+        event_filters.append("e.ts < ?")
+        time_params.append(until)
+    label_where = (
+        " WHERE (ts_end IS NULL OR ts_start < ts_end) AND " + " AND ".join(label_filters)
+        if label_filters
+        else ""
+    )
+    rows = conn.execute(
+        "SELECT label, COUNT(*), COALESCE(SUM(ts_end IS NULL), 0),"
+        " COALESCE(SUM(CASE WHEN ts_end IS NOT NULL THEN ts_end - ts_start ELSE 0 END), 0)"
+        " FROM labels" + label_where + " GROUP BY label ORDER BY label",
+        time_params,
+    ).fetchall()
+
+    sample_and = (sample_where + " AND ") if sample_where else " WHERE "
+    event_where = (" WHERE " + " AND ".join(event_filters) + " AND ") if event_filters else " WHERE "
+
+    summary = []
+    for name, windows, open_windows, closed_duration_ms in rows:
+        sample_count = conn.execute(
+            "SELECT COUNT(*) FROM samples AS s" + sample_and
+            + "EXISTS (SELECT 1 FROM labels AS l WHERE l.label = ?"
+            " AND l.ts_start <= s.ts AND (l.ts_end IS NULL OR s.ts < l.ts_end))",
+            [*sample_params, name],
+        ).fetchone()[0]
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM events AS e" + event_where
+            + "EXISTS (SELECT 1 FROM labels AS l WHERE l.label = ?"
+            " AND l.ts_start <= e.ts AND (l.ts_end IS NULL OR e.ts < l.ts_end))",
+            [*time_params, name],
+        ).fetchone()[0]
+        summary.append({
+            "label": name,
+            "windows": windows,
+            "open_windows": open_windows,
+            "closed_duration_ms": closed_duration_ms,
+            "samples": sample_count,
+            "events": event_count,
+        })
+    return summary
+
+
+def analyze_dataset(
+    db: str | pathlib.Path,
+    *,
+    boot_id: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+    gap_factor: float = 2.0,
+) -> dict:
+    """Analyse exploratoire sur un snapshot SQLite cohérent en lecture seule."""
+    _validate_range(since, until)
+    if not math.isfinite(gap_factor) or gap_factor <= 1.0:
+        raise ValueError("--gap-factor doit être un nombre fini > 1")
+    where, params = _sample_filter_sql(boot_id, since, until, alias="s")
+    with read_snapshot(db) as conn:
+        metrics, order_col = _numeric_metrics(conn)
+        total_samples = conn.execute(
+            "SELECT COUNT(*) FROM samples AS s" + where, params
+        ).fetchone()[0]
+        return {
+            "boot_id": boot_id,
+            "window": {"since": since, "until": until},
+            "gap_factor": gap_factor,
+            "samples": total_samples,
+            "cadence": _compute_cadence(conn, order_col, where, params, gap_factor),
+            "metrics": _compute_numeric_stats(conn, metrics, total_samples, where, params),
+            "labels": _compute_label_summary(conn, where, params, since, until),
+        }
+
+
+def compare_labels(
+    db: str | pathlib.Path,
+    baseline_label: str,
+    target_label: str,
+    *,
+    boot_id: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+) -> dict:
+    """Compare la distribution des métriques numériques entre deux labels.
+
+    Mesure le décalage moyen (`delta_mean`) et le décalage normalisé par
+    l'écart-type de la référence (`z_shift`), sans inférer de vérité terrain.
+    """
+    baseline_label = baseline_label.strip()
+    target_label = target_label.strip()
+    if not baseline_label or not target_label:
+        raise ValueError("les noms de labels à comparer ne peuvent pas être vides")
+    _validate_range(since, until)
+    base_where, base_params = _sample_filter_sql(boot_id, since, until, alias="s")
+    label_exists = (
+        "EXISTS (SELECT 1 FROM labels AS l WHERE l.label = ?"
+        " AND l.ts_start <= s.ts AND (l.ts_end IS NULL OR s.ts < l.ts_end))"
+    )
+    prefix = (base_where + " AND ") if base_where else " WHERE "
+    single_where = prefix + label_exists
+    overlap_where = prefix + label_exists + " AND " + label_exists
+
+    with read_snapshot(db) as conn:
+        metrics, _ = _numeric_metrics(conn)
+        baseline_params = [*base_params, baseline_label]
+        target_params = [*base_params, target_label]
+        baseline_count = conn.execute(
+            "SELECT COUNT(*) FROM samples AS s" + single_where, baseline_params
+        ).fetchone()[0]
+        target_count = conn.execute(
+            "SELECT COUNT(*) FROM samples AS s" + single_where, target_params
+        ).fetchone()[0]
+        overlap_count = conn.execute(
+            "SELECT COUNT(*) FROM samples AS s" + overlap_where,
+            [*base_params, baseline_label, target_label],
+        ).fetchone()[0]
+
+        base_stats = _compute_numeric_stats(conn, metrics, baseline_count, single_where, baseline_params)
+        target_stats = _compute_numeric_stats(conn, metrics, target_count, single_where, target_params)
+
+    comparisons = []
+    for base, target in zip(base_stats, target_stats):
+        b_mean, b_std = base["mean"], base["std"]
+        t_mean, t_std = target["mean"], target["std"]
+        delta = None if b_mean is None or t_mean is None else t_mean - b_mean
+        z_shift = None if delta is None or b_std is None or b_std == 0.0 else delta / b_std
+        comparisons.append({
+            "column": base["column"],
+            "baseline_present": base["present"],
+            "baseline_mean": b_mean,
+            "baseline_std": b_std,
+            "target_present": target["present"],
+            "target_mean": t_mean,
+            "target_std": t_std,
+            "delta_mean": delta,
+            "z_shift": z_shift,
+        })
+    comparisons.sort(
+        key=lambda item: (item["z_shift"] is None, -(abs(item["z_shift"]) if item["z_shift"] is not None else 0.0), item["column"])
+    )
+    return {
+        "boot_id": boot_id,
+        "window": {"since": since, "until": until},
+        "baseline": {"label": baseline_label, "samples": baseline_count},
+        "target": {"label": target_label, "samples": target_count},
+        "overlap_samples": overlap_count,
+        "metrics": comparisons,
+    }
+
+
+def _fmt(value: float | None, digits: int = 2) -> str:
+    return "n/a" if value is None else f"{value:.{digits}f}"
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Analyse exploratoire du dataset AAD")
+    parser.add_argument("--db", default="data/metrics.db", help="base SQLite existante")
+    parser.add_argument("--boot", dest="boot_id", help="limiter les mesures à un boot_id")
+    parser.add_argument("--since", type=int, help="epoch ms inclusif")
+    parser.add_argument("--until", type=int, help="epoch ms exclusif")
+    parser.add_argument("--gap-factor", type=float, default=2.0,
+                        help="multiple de la cadence médiane définissant un trou (défaut : 2.0)")
+    parser.add_argument("--compare", nargs=2, metavar=("BASELINE", "TARGET"),
+                        help="comparer les métriques numériques entre deux labels")
+    parser.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
+    args = parser.parse_args(argv)
+
+    try:
+        if args.compare:
+            result = compare_labels(
+                args.db, args.compare[0], args.compare[1],
+                boot_id=args.boot_id, since=args.since, until=args.until,
+            )
+        else:
+            result = analyze_dataset(
+                args.db, boot_id=args.boot_id, since=args.since,
+                until=args.until, gap_factor=args.gap_factor,
+            )
+    except (ValueError, OSError, sqlite3.Error) as exc:
+        parser.error(str(exc))
+
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.compare:
+        b = result["baseline"]
+        t = result["target"]
+        print(f"Comparaison : {b['label']} ({b['samples']} mesures) vs {t['label']} ({t['samples']} mesures)")
+        if result["overlap_samples"]:
+            print(f"Attention : {result['overlap_samples']} mesure(s) portent les deux labels")
+        for item in result["metrics"]:
+            print(
+                f"  {item['column']} : {_fmt(item['baseline_mean'])} ± {_fmt(item['baseline_std'])}"
+                f" → {_fmt(item['target_mean'])} ± {_fmt(item['target_std'])}"
+                f" (Δ={_fmt(item['delta_mean'])}, z={_fmt(item['z_shift'])})"
+            )
+        return
+
+    print(f"Mesures analysées : {result['samples']}")
+    print("Cadence par boot :")
+    for boot in result["cadence"]:
+        print(
+            f"  boot {boot['boot_id']} : {boot['samples']} mesures, "
+            f"médiane={_fmt(boot['median_dt_ms'], 1)} ms, p95={_fmt(boot['p95_dt_ms'], 1)} ms, "
+            f"trous={boot['gaps']}, doublons={boot['duplicate_timestamps']}, "
+            f"retours={boot['clock_regressions']}"
+        )
+    print("Métriques numériques :")
+    for metric in result["metrics"]:
+        flag = " [constante]" if metric["is_constant"] else ""
+        print(
+            f"  {metric['column']} : n={metric['present']}, "
+            f"min={_fmt(metric['min'])}, max={_fmt(metric['max'])}, "
+            f"moy={_fmt(metric['mean'])}, std={_fmt(metric['std'])}{flag}"
+        )
+    if result["labels"]:
+        print("Classes labellisées :")
+        for item in result["labels"]:
+            print(
+                f"  {item['label']} : {item['windows']} fenêtre(s) ({item['open_windows']} ouverte(s)), "
+                f"{item['samples']} mesure(s), {item['events']} événement(s)"
+            )
+
+
+if __name__ == "__main__":
+    main()

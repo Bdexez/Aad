@@ -303,6 +303,12 @@ database:
 - **Pairwise Pearson correlation (`--correlate COLUMN`)**: computes exact
   pairwise `r` and `r_squared` inside SQLite over non-NULL intersections
   (`--min-pairs`, default 3), ranked by `|r|`.
+- **Robust outlier diagnostics (`--outliers`)**: computes `p25`, `median`, `p75`,
+  `iqr`, `mad` and flags values exceeding `--z-threshold` (default 3.5) under
+  the Iglewicz-Hoaglin modified z-score (`--columns` restricts the check).
+- **Label quality audit (`--check-labels`)**: lists empty windows, open windows,
+  windows with zero matching samples, window overlaps (distinguishing same-label
+  from cross-label overlaps) and multi-label sample counts.
 
 ### Backing up during collection
 

@@ -158,6 +158,53 @@ class BaselineDetectorTest(unittest.TestCase):
         self.assertAlmostEqual(second["evaluation"]["f1"], 1.0)
         self.assertEqual(second["baseline"]["loaded_from"], str(model_path))
 
+    def test_control_for_scores_residuals_so_hot_under_load_is_normal_and_hot_at_idle_is_anomalous(self):
+        # Relation normale : temp_c ≈ 40 + 40 * cpu_util ± 1°C
+        self.storage.ensure_columns(["cpu_util"])
+        baseline_rows = []
+        loads = [0.0, 0.25, 0.5, 0.75, 1.0, 0.1, 0.4, 0.6, 0.9, 0.2]
+        noise = [-0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5]
+        for i, (u, eps) in enumerate(zip(loads, noise)):
+            baseline_rows.append({
+                "ts": 1000 * (i + 1), "boot_id": "a", "cpu_util": u, "temp_c": 40.0 + 40.0 * u + eps,
+            })
+        # Cible : 3 ticks chauds MAIS sous forte charge (normal !) puis 3 ticks chauds AU REPOS (anomalie !)
+        target_rows = [
+            {"ts": 20000, "boot_id": "a", "cpu_util": 1.0, "temp_c": 80.5},
+            {"ts": 21000, "boot_id": "a", "cpu_util": 1.0, "temp_c": 79.5},
+            {"ts": 22000, "boot_id": "a", "cpu_util": 1.0, "temp_c": 80.0},
+            {"ts": 23000, "boot_id": "a", "cpu_util": 0.05, "temp_c": 72.0},
+            {"ts": 24000, "boot_id": "a", "cpu_util": 0.05, "temp_c": 74.0},
+            {"ts": 25000, "boot_id": "a", "cpu_util": 0.05, "temp_c": 73.0},
+        ]
+        self.storage.insert_samples(baseline_rows + target_rows)
+        norm = self.storage.start_label(1000, "normal")
+        self.storage.end_label(15000, norm)
+        idle_hot = self.storage.start_label(23000, "cooling_fail")
+        self.storage.end_label(26000, idle_hot)
+
+        model_path = self.db.with_name("cond_model.json")
+        res = detect_anomalies(
+            self.db,
+            baseline_label="normal",
+            since=20000,
+            columns=["temp_c"],
+            control_for="cpu_util",
+            eval_label="cooling_fail",
+            threshold=4.0,
+            min_samples=3,
+            save_model=model_path,
+        )
+        self.assertEqual(len(res["episodes"]), 1)
+        self.assertEqual(res["episodes"][0]["ts_start"], 23000)
+        self.assertAlmostEqual(res["evaluation"]["f1"], 1.0)
+        # Rechargement du modèle conditionnel
+        reloaded = detect_anomalies(
+            self.db, load_model=model_path, since=20000, eval_label="cooling_fail",
+            threshold=4.0, min_samples=3,
+        )
+        self.assertAlmostEqual(reloaded["evaluation"]["f1"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

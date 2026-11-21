@@ -28,6 +28,8 @@ class FeatureBaseline:
     scale: float
     method: str  # "mad" | "std"
     present: int
+    intercept: float | None = None
+    slope: float = 0.0
 
 
 def save_baseline_model(
@@ -47,6 +49,8 @@ def save_baseline_model(
                 "scale": f.scale,
                 "method": f.method,
                 "present": f.present,
+                "intercept": f.intercept,
+                "slope": f.slope,
             }
             for f in features
         ],
@@ -79,15 +83,24 @@ def load_baseline_model(path: str | pathlib.Path) -> tuple[dict, list[FeatureBas
         scale = item.get("scale")
         method = item.get("method")
         present = item.get("present", 0)
+        intercept = item.get("intercept")
+        slope = item.get("slope", 0.0)
         if (
             not isinstance(col, str)
             or not isinstance(center, (int, float)) or not math.isfinite(center)
             or not isinstance(scale, (int, float)) or not math.isfinite(scale) or scale <= 0
             or method not in ("mad", "std")
             or not isinstance(present, int) or present < 0
+            or (intercept is not None and (not isinstance(intercept, (int, float)) or not math.isfinite(intercept)))
+            or not isinstance(slope, (int, float)) or not math.isfinite(slope)
         ):
             raise ValueError(f"paramètres invalides pour la métrique {col!r}")
-        features.append(FeatureBaseline(col, float(center), float(scale), method, present))
+        features.append(
+            FeatureBaseline(
+                col, float(center), float(scale), method, present,
+                None if intercept is None else float(intercept), float(slope),
+            )
+        )
     meta = raw.get("baseline") if isinstance(raw.get("baseline"), dict) else {}
     return meta, features
 
@@ -115,11 +128,30 @@ def _scoped_where(
     return where, params
 
 
+def _robust_center_scale(values: list[float]) -> tuple[float, float, str] | None:
+    n = len(values)
+    if n < 2:
+        return None
+    ordered = sorted(values)
+    median = _quantile(ordered, 0.50)
+    abs_devs = sorted(abs(v - median) for v in ordered)
+    mad = _quantile(abs_devs, 0.50)
+    if mad is not None and mad > 0.0:
+        return median, mad / _MAD_SCALE, "mad"
+    mean = sum(ordered) / n
+    var = sum((v - mean) ** 2 for v in ordered) / (n - 1)
+    std = math.sqrt(max(0.0, var))
+    if std > 0.0:
+        return mean, std, "std"
+    return None
+
+
 def _fit_baseline(
     conn: sqlite3.Connection,
     columns: Sequence[str],
     where: str,
     params: Sequence[str | int],
+    control_for: str | None = None,
 ) -> tuple[int, list[FeatureBaseline], list[str]]:
     total = conn.execute("SELECT COUNT(*) FROM samples AS s" + where, params).fetchone()[0]
     if total < 2:
@@ -127,32 +159,49 @@ def _fit_baseline(
     prefix = (where + " AND ") if where else " WHERE "
     fitted: list[FeatureBaseline] = []
     skipped: list[str] = []
+    qx = quote_identifier(control_for) if control_for is not None else None
     for col in columns:
+        if col == control_for:
+            continue
         qc = quote_identifier(col)
-        values = [
-            row[0]
-            for row in conn.execute(
-                f"SELECT {qc} FROM samples AS s{prefix}{qc} IS NOT NULL ORDER BY {qc}",
-                params,
-            )
-        ]
-        n = len(values)
-        if n < 2:
-            skipped.append(col)
-            continue
-        median = _quantile(values, 0.50)
-        abs_devs = sorted(abs(v - median) for v in values)
-        mad = _quantile(abs_devs, 0.50)
-        if mad is not None and mad > 0.0:
-            fitted.append(FeatureBaseline(col, median, mad / _MAD_SCALE, "mad", n))
-            continue
-        mean = sum(values) / n
-        var = sum((v - mean) ** 2 for v in values) / (n - 1)
-        std = math.sqrt(max(0.0, var))
-        if std > 0.0:
-            fitted.append(FeatureBaseline(col, mean, std, "std", n))
+        if qx is None:
+            values = [
+                row[0]
+                for row in conn.execute(
+                    f"SELECT {qc} FROM samples AS s{prefix}{qc} IS NOT NULL",
+                    params,
+                )
+            ]
+            stats = _robust_center_scale(values)
+            if stats is None:
+                skipped.append(col)
+            else:
+                center, scale, method = stats
+                fitted.append(FeatureBaseline(col, center, scale, method, len(values)))
         else:
-            skipped.append(col)
+            pairs = conn.execute(
+                f"SELECT {qx}, {qc} FROM samples AS s{prefix}{qx} IS NOT NULL AND {qc} IS NOT NULL",
+                params,
+            ).fetchall()
+            n = len(pairs)
+            if n < 3:
+                skipped.append(col)
+                continue
+            mx = sum(x for x, _ in pairs) / n
+            my = sum(y for _, y in pairs) / n
+            sxx = sum((x - mx) ** 2 for x, _ in pairs)
+            if sxx <= 0.0:
+                skipped.append(col)
+                continue
+            slope = sum((x - mx) * (y - my) for x, y in pairs) / sxx
+            intercept = my - slope * mx
+            residuals = [y - (intercept + slope * x) for x, y in pairs]
+            stats = _robust_center_scale(residuals)
+            if stats is None:
+                skipped.append(col)
+            else:
+                center, scale, method = stats
+                fitted.append(FeatureBaseline(col, center, scale, method, n, intercept, slope))
     if not fitted:
         raise ValueError("aucune métrique numérique non constante dans la référence")
     return total, fitted, skipped
@@ -184,6 +233,7 @@ def detect_anomalies(
     target_label: str | None = None,
     eval_label: str | None = None,
     columns: Sequence[str] | None = None,
+    control_for: str | None = None,
     threshold: float = 4.0,
     min_samples: int = 3,
     top_contributors: int = 3,
@@ -239,6 +289,9 @@ def detect_anomalies(
 
         if load_model is not None:
             loaded_meta, loaded_features = load_baseline_model(load_model)
+            control_for = loaded_meta.get("control_for")
+            if control_for is not None and control_for not in numeric_names:
+                raise ValueError(f"colonne de contrôle du modèle absente: {control_for!r}")
             selected_set = set(selected)
             fitted = [fb for fb in loaded_features if fb.column in selected_set]
             skipped = [fb.column for fb in loaded_features if fb.column not in selected_set]
@@ -251,11 +304,16 @@ def detect_anomalies(
                 "features_skipped": skipped,
             }
         else:
-            baseline_count, fitted, skipped = _fit_baseline(conn, selected, base_where, base_params)
+            if control_for is not None and control_for not in numeric_names:
+                raise ValueError(f"colonne de contrôle introuvable: {control_for!r}")
+            baseline_count, fitted, skipped = _fit_baseline(
+                conn, selected, base_where, base_params, control_for=control_for,
+            )
             baseline_meta = {
                 "label": baseline_label,
                 "boot_id": baseline_boot,
                 "window": {"since": baseline_since, "until": baseline_until},
+                "control_for": control_for,
                 "samples": baseline_count,
                 "features_used": len(fitted),
                 "features_skipped": skipped,
@@ -264,6 +322,7 @@ def detect_anomalies(
                 save_baseline_model(save_model, baseline_meta, fitted)
 
         projection = ", ".join(f"s.{quote_identifier(fb.column)}" for fb in fitted)
+        control_select = f", s.{quote_identifier(control_for)}" if control_for is not None else ""
         eval_select = ""
         query_params: list[str | int] = []
         if eval_label is not None:
@@ -273,7 +332,7 @@ def detect_anomalies(
         query_params.extend(target_params)
 
         cursor = conn.execute(
-            f"SELECT s.boot_id, s.ts, {projection}{eval_select}"
+            f"SELECT s.boot_id, s.ts, {projection}{control_select}{eval_select}"
             f" FROM samples AS s{target_where}"
             f" ORDER BY s.boot_id, s.{quote_identifier(order_col)}",
             query_params,
@@ -340,11 +399,14 @@ def detect_anomalies(
             run_contrib = {}
 
         n_feat = len(fitted)
+        has_control = control_for is not None
         for row in cursor:
             boot = row[0]
             ts = row[1]
             values = row[2 : 2 + n_feat]
-            is_pos = bool(row[2 + n_feat]) if eval_label is not None else False
+            ctrl_val = row[2 + n_feat] if has_control else None
+            eval_idx = 2 + n_feat + (1 if has_control else 0)
+            is_pos = bool(row[eval_idx]) if eval_label is not None else False
             total_scored += 1
 
             if run_len > 0 and boot != run_boot:
@@ -353,17 +415,23 @@ def detect_anomalies(
             max_abs = 0.0
             sq_sum = 0.0
             n_obs = 0
-            z_obs: list[tuple[FeatureBaseline, float, float]] = []
+            z_obs: list[tuple[FeatureBaseline, float, float, float]] = []
             for fb, val in zip(fitted, values):
                 if val is None:
                     continue
-                z = (val - fb.center) / fb.scale
+                if fb.intercept is not None:
+                    if ctrl_val is None:
+                        continue
+                    expected = fb.intercept + fb.slope * ctrl_val + fb.center
+                else:
+                    expected = fb.center
+                z = (val - expected) / fb.scale
                 az = abs(z)
                 if az > max_abs:
                     max_abs = az
                 sq_sum += z * z
                 n_obs += 1
-                z_obs.append((fb, z, val))
+                z_obs.append((fb, z, val, expected))
 
             if n_obs > 0 and max_abs >= threshold:
                 rms_z = math.sqrt(sq_sum / n_obs)
@@ -377,11 +445,11 @@ def detect_anomalies(
                 run_rms_sum += rms_z
                 if is_pos:
                     run_eval_pos += 1
-                for fb, z, val in z_obs:
+                for fb, z, val, expected in z_obs:
                     az = abs(z)
                     prev = run_contrib.get(fb.column)
                     if prev is None or az > prev[0]:
-                        run_contrib[fb.column] = (az, z, val, fb.center)
+                        run_contrib[fb.column] = (az, z, val, expected)
             else:
                 flush_run()
                 if eval_label is not None:
@@ -446,6 +514,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--target-label", help="limiter la cible à un label")
     parser.add_argument("--eval-label", help="évaluer précision/rappel/F1 face à un label terrain")
     parser.add_argument("--columns", nargs="+", help="sous-ensemble de métriques numériques")
+    parser.add_argument("--control-for", help="métrique de charge/contexte utilisée pour le scoring par résidus")
     parser.add_argument("--threshold", type=float, default=4.0,
                         help="seuil de z-score absolu (défaut : 4.0)")
     parser.add_argument("--min-samples", type=int, default=3,
@@ -478,6 +547,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             target_label=args.target_label,
             eval_label=args.eval_label,
             columns=args.columns,
+            control_for=args.control_for,
             threshold=args.threshold,
             min_samples=args.min_samples,
             event_margin_ms=args.event_margin_ms,

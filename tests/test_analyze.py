@@ -10,7 +10,13 @@ import tempfile
 import unittest
 
 from collector import analyze as analyze_module
-from collector.analyze import analyze_dataset, compare_labels, correlate_metric, detect_outliers
+from collector.analyze import (
+    analyze_dataset,
+    audit_labels,
+    compare_labels,
+    correlate_metric,
+    detect_outliers,
+)
 from collector.main import SCHEMA
 from collector.storage import Storage
 
@@ -249,6 +255,35 @@ class AnalyzeDatasetTest(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as out:
             analyze_module.main(["--db", str(self.db), "--outliers", "--columns", "temp_c"])
         self.assertIn("outliers=1/10", out.getvalue())
+
+    def test_audit_labels_detects_empty_open_sampleless_and_cross_overlaps(self):
+        self.storage.insert_samples([
+            {"ts": 100, "boot_id": "a", "temp_c": 40.0},
+            {"ts": 150, "boot_id": "a", "temp_c": 50.0},
+        ])
+        w_normal = self.storage.start_label(100, "normal")
+        self.storage.end_label(200, w_normal)
+        w_hot = self.storage.start_label(150, "airflow_blocked")
+        self.storage.end_label(250, w_hot)
+        w_empty = self.storage.start_label(300, "oops")
+        self.storage.end_label(300, w_empty)
+        w_open = self.storage.start_label(500, "ongoing")
+
+        audit = audit_labels(self.db)
+        self.assertEqual(audit["total_windows"], 4)
+        self.assertEqual([w["id"] for w in audit["empty_windows"]], [w_empty])
+        self.assertEqual([w["id"] for w in audit["open_windows"]], [w_open])
+        self.assertEqual([w["id"] for w in audit["sampleless_windows"]], [w_open])
+        self.assertEqual(len(audit["overlaps"]), 1)
+        self.assertFalse(audit["overlaps"][0]["same_label"])
+        self.assertEqual(audit["overlaps"][0]["overlap_start"], 150)
+        self.assertEqual(audit["overlaps"][0]["overlap_end"], 200)
+        self.assertEqual(audit["cross_label_overlap_samples"], 1)
+
+        with redirect_stdout(io.StringIO()) as out:
+            analyze_module.main(["--db", str(self.db), "--check-labels"])
+        self.assertIn("Fenêtres vides : 1", out.getvalue())
+        self.assertIn("1 mesure(s) multi-labels", out.getvalue())
 
 
 if __name__ == "__main__":

@@ -110,3 +110,20 @@ class LabelsTest(unittest.TestCase):
         self.assertEqual(payload, [{
             "id": first, "ts_start": 100, "ts_end": 200, "label": "airflow_blocked", "notes": "intake",
         }])
+
+    def test_cli_note_and_delete_update_and_remove_labels_safely(self):
+        first = self.storage.start_label(100, "normal", "old")
+        with redirect_stdout(io.StringIO()) as out:
+            label_module.main(["--db", str(self.db), "note", str(first), "-n", "updated"])
+        self.assertIn("mises à jour", out.getvalue())
+        self.assertEqual(self.storage.list_labels(include_closed=True)[0][4], "updated")
+
+        with redirect_stdout(io.StringIO()) as out:
+            label_module.main(["--db", str(self.db), "delete", str(first)])
+        self.assertIn("supprimé", out.getvalue())
+        self.assertEqual(self.storage.list_labels(include_closed=True), [])
+
+        for cmd in (("note", "999", "-n", "x"), ("delete", "999"), ("delete", "0")):
+            with self.subTest(cmd=cmd), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as err:
+                label_module.main(["--db", str(self.db), *cmd])
+            self.assertEqual(err.exception.code, 2)

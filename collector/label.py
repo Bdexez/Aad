@@ -61,6 +61,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     listing.add_argument("--label", help="filtrer sur un nom de label exact")
     listing.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
 
+    note = sub.add_parser("note", help="mettre à jour les notes d'une fenêtre existante")
+    note.add_argument("id", type=int)
+    note.add_argument("-n", "--notes", required=True)
+
+    delete = sub.add_parser("delete", help="supprimer une fenêtre créée par erreur")
+    delete.add_argument("id", type=int)
+
     args = ap.parse_args(argv)
     if args.command == "start":
         args.label = args.label.strip()
@@ -69,7 +76,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     else:
         if not pathlib.Path(args.db).is_file():
             ap.error(f"base introuvable: {args.db}")
-        if args.command == "end" and args.id is not None and args.id <= 0:
+        if args.command in ("end", "note", "delete") and args.id is not None and args.id <= 0:
             ap.error("l'identifiant du label doit être > 0")
     try:
         with Storage(args.db, args.schema) as storage:
@@ -81,6 +88,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             elif args.command == "end":
                 closed = storage.end_label(now_ms(), args.id)
                 print(f"{closed} label(s) fermé(s)")
+            elif args.command == "note":
+                if not storage.update_label_notes(args.id, args.notes):
+                    raise ValueError(f"label #{args.id} introuvable")
+                print(f"notes du label #{args.id} mises à jour")
+            elif args.command == "delete":
+                if not storage.delete_label(args.id):
+                    raise ValueError(f"label #{args.id} introuvable")
+                print(f"label #{args.id} supprimé")
             else:
                 rows = storage.list_labels(include_closed=args.all, label=args.label)
                 if args.json:

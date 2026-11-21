@@ -371,6 +371,103 @@ def compare_labels(
     }
 
 
+def correlate_metric(
+    db: str | pathlib.Path,
+    target_column: str,
+    *,
+    boot_id: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+    min_pairs: int = 3,
+) -> dict:
+    """Corrélation de Pearson entre une métrique cible et les autres sondes numériques.
+
+    Calculée en deux passes SQLite sur l'intersection non-NULL de chaque paire
+    (O(1) mémoire Python), sans imputation des valeurs manquantes.
+    """
+    if min_pairs < 2:
+        raise ValueError("--min-pairs doit être >= 2")
+    _validate_range(since, until)
+    where, params = _sample_filter_sql(boot_id, since, until, alias="s")
+    with read_snapshot(db) as conn:
+        metrics, _ = _numeric_metrics(conn)
+        numeric_names = [name for name, _ in metrics]
+        if target_column not in numeric_names:
+            raise ValueError(f"métrique numérique introuvable: {target_column!r}")
+        others = [name for name in numeric_names if name != target_column]
+        qt = quote_identifier(target_column)
+        correlations: list[dict] = []
+        if others:
+            p1_exprs = []
+            for col in others:
+                qc = quote_identifier(col)
+                cond = f"{qt} IS NOT NULL AND {qc} IS NOT NULL"
+                p1_exprs.append(
+                    f"COUNT(CASE WHEN {cond} THEN 1 END),"
+                    f" AVG(CASE WHEN {cond} THEN {qt} END),"
+                    f" AVG(CASE WHEN {cond} THEN {qc} END)"
+                )
+            p1_row = conn.execute(
+                "SELECT " + ", ".join(p1_exprs) + " FROM samples AS s" + where,
+                params,
+            ).fetchone()
+
+            p2_exprs = []
+            p2_params: list[float] = []
+            p2_cols: list[tuple[int, str, int]] = []
+            pairs_by_col: dict[str, int] = {}
+            for idx, col in enumerate(others):
+                pairs, mx, my = p1_row[idx * 3 : (idx + 1) * 3]
+                pairs_by_col[col] = pairs
+                if pairs >= min_pairs and mx is not None and my is not None:
+                    qc = quote_identifier(col)
+                    cond = f"{qt} IS NOT NULL AND {qc} IS NOT NULL"
+                    p2_exprs.append(
+                        f"SUM(CASE WHEN {cond} THEN ({qt} - ?) * ({qc} - ?) END),"
+                        f" SUM(CASE WHEN {cond} THEN ({qt} - ?) * ({qt} - ?) END),"
+                        f" SUM(CASE WHEN {cond} THEN ({qc} - ?) * ({qc} - ?) END)"
+                    )
+                    p2_params.extend((mx, my, mx, mx, my, my))
+                    p2_cols.append((len(p2_cols), col, pairs))
+
+            r_by_col: dict[str, float | None] = {}
+            if p2_exprs:
+                p2_row = conn.execute(
+                    "SELECT " + ", ".join(p2_exprs) + " FROM samples AS s" + where,
+                    [*p2_params, *params],
+                ).fetchone()
+                for pos, col, _ in p2_cols:
+                    sxy, sxx, syy = p2_row[pos * 3 : (pos + 1) * 3]
+                    if sxy is None or sxx is None or syy is None:
+                        r_by_col[col] = None
+                        continue
+                    denom = math.sqrt(max(0.0, sxx) * max(0.0, syy))
+                    r_by_col[col] = max(-1.0, min(1.0, sxy / denom)) if denom > 0.0 else None
+
+            for col in others:
+                r = r_by_col.get(col)
+                correlations.append({
+                    "column": col,
+                    "pairs": pairs_by_col[col],
+                    "r": r,
+                    "r_squared": None if r is None else r * r,
+                })
+            correlations.sort(
+                key=lambda item: (
+                    item["r"] is None,
+                    -(abs(item["r"]) if item["r"] is not None else 0.0),
+                    item["column"],
+                )
+            )
+    return {
+        "boot_id": boot_id,
+        "window": {"since": since, "until": until},
+        "target": target_column,
+        "min_pairs": min_pairs,
+        "correlations": correlations,
+    }
+
+
 def _fmt(value: float | None, digits: int = 2) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
 
@@ -383,8 +480,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--until", type=int, help="epoch ms exclusif")
     parser.add_argument("--gap-factor", type=float, default=2.0,
                         help="multiple de la cadence médiane définissant un trou (défaut : 2.0)")
-    parser.add_argument("--compare", nargs=2, metavar=("BASELINE", "TARGET"),
-                        help="comparer les métriques numériques entre deux labels")
+    parser.add_argument("--min-pairs", type=int, default=3,
+                        help="paires minimales pour calculer une corrélation (défaut : 3)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--compare", nargs=2, metavar=("BASELINE", "TARGET"),
+                      help="comparer les métriques numériques entre deux labels")
+    mode.add_argument("--correlate", metavar="COLUMN",
+                      help="corrélations de Pearson entre une métrique cible et les autres sondes")
     parser.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
     args = parser.parse_args(argv)
 
@@ -393,6 +495,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             result = compare_labels(
                 args.db, args.compare[0], args.compare[1],
                 boot_id=args.boot_id, since=args.since, until=args.until,
+            )
+        elif args.correlate:
+            result = correlate_metric(
+                args.db, args.correlate,
+                boot_id=args.boot_id, since=args.since, until=args.until,
+                min_pairs=args.min_pairs,
             )
         else:
             result = analyze_dataset(
@@ -404,6 +512,15 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.correlate:
+        print(f"Corrélations de Pearson avec {result['target']} (min_pairs={result['min_pairs']}) :")
+        for item in result["correlations"]:
+            print(
+                f"  {item['column']} : r={_fmt(item['r'], 3)}, "
+                f"r²={_fmt(item['r_squared'], 3)} (n={item['pairs']})"
+            )
         return
 
     if args.compare:

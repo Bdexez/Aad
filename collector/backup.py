@@ -14,6 +14,14 @@ import time
 from .database import read_snapshot
 
 _EXPECTED_TABLES = ("samples", "boots", "events", "labels")
+_EXPECTED_INDEXES = (
+    "idx_samples_ts",
+    "idx_samples_boot",
+    "idx_events_ts",
+    "idx_events_kind",
+    "idx_events_dedup",
+    "idx_labels_ts",
+)
 
 
 def verify_database(db: str | pathlib.Path) -> dict:
@@ -30,6 +38,11 @@ def verify_database(db: str | pathlib.Path) -> dict:
         missing = [table for table in _EXPECTED_TABLES if table not in existing]
         if "samples" in missing:
             raise ValueError("la base ne contient pas de table samples")
+        existing_indexes = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+        }
+        missing_indexes = [idx for idx in _EXPECTED_INDEXES if idx not in existing_indexes]
         counts = {
             table: int(conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
             for table in _EXPECTED_TABLES
@@ -48,6 +61,7 @@ def verify_database(db: str | pathlib.Path) -> dict:
         "quick_check": quick_check,
         "journal_mode": journal_mode,
         "missing_tables": missing,
+        "missing_indexes": missing_indexes,
         "counts": counts,
         "size": {
             "db_bytes": db_bytes,
@@ -122,6 +136,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 counts = ", ".join(f"{k}={v}" for k, v in result["counts"].items())
                 size_kb = result["size"]["total_bytes"] / 1024.0
                 print(f"base valide ({result['journal_mode']}, {size_kb:.1f} KiB) : {counts}")
+                if result["missing_indexes"]:
+                    print(f"index manquants : {', '.join(result['missing_indexes'])}")
             return
         destination = backup_database(args.db, args.output, timeout=args.timeout)
     except (ValueError, OSError, sqlite3.Error) as exc:

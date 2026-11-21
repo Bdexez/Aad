@@ -85,7 +85,8 @@ def format_summary_markdown(result: dict) -> str:
         if proj["estimated_mib_per_day"] is not None
         else "n/a"
     )
-    return "\n".join([
+    missing_idx = result["integrity"].get("missing_indexes") or []
+    lines = [
         f"# Synthèse AAD — {verdict}",
         "",
         "| Indicateur | Valeur |",
@@ -96,7 +97,10 @@ def format_summary_markdown(result: dict) -> str:
         f"| Bornes physiques | {result['physical_bounds']['total_violations']} violation(s) sur {result['physical_bounds']['checked_metrics']} sonde(s) |",
         f"| Projection disque | {proj_str} |",
         f"| Événements | {result['events_total']} |",
-    ])
+    ]
+    if missing_idx:
+        lines.append(f"| Index manquants | {', '.join(f'`{i}`' for i in missing_idx)} |")
+    return "\n".join(lines)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -143,6 +147,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             f"(~{proj['estimated_mib_14d']:.0f} MiB / 14 j)"
         )
     print(f"Événements  : {result['events_total']}")
+    missing_idx = result["integrity"].get("missing_indexes") or []
+    if missing_idx:
+        print(f"Index manq. : {', '.join(missing_idx)}")
 
 
 if __name__ == "__main__":

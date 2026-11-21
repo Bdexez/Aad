@@ -7,7 +7,7 @@ import time
 import unittest
 from unittest import mock
 
-from collector.backup import backup_database
+from collector.backup import backup_database, verify_database
 from collector.main import SCHEMA
 from collector.storage import Storage
 
@@ -109,3 +109,22 @@ class BackupTest(unittest.TestCase):
             self.assertEqual(target.execute("PRAGMA table_info(samples)").fetchone()[1], "ts")
             self.assertEqual(target.execute("SELECT * FROM samples").fetchall(), [(1, "a")])
         target.close()
+
+    def test_verify_database_reports_missing_indexes_without_modifying_db(self):
+        res_ok = verify_database(self.db)
+        self.assertTrue(res_ok["ok"])
+        self.assertEqual(res_ok["missing_indexes"], [])
+
+        no_idx = self.db.with_name("no_idx.db")
+        with sqlite3.connect(no_idx) as conn:
+            conn.executescript(
+                "CREATE TABLE samples (sample_id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, boot_id TEXT NOT NULL);"
+                "CREATE TABLE boots (boot_id TEXT PRIMARY KEY, ts_first INTEGER NOT NULL);"
+                "CREATE TABLE events (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, source TEXT NOT NULL, kind TEXT NOT NULL);"
+                "CREATE TABLE labels (id INTEGER PRIMARY KEY, ts_start INTEGER NOT NULL, ts_end INTEGER, label TEXT NOT NULL);"
+            )
+        conn.close()
+        res_missing = verify_database(no_idx)
+        self.assertTrue(res_missing["ok"])
+        self.assertIn("idx_samples_boot", res_missing["missing_indexes"])
+        self.assertIn("idx_events_dedup", res_missing["missing_indexes"])

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
 import io
+import json
 import pathlib
 import tempfile
 import unittest
@@ -98,3 +99,14 @@ class LabelsTest(unittest.TestCase):
                 self.cli("end")
         self.assertEqual(error.exception.code, 2)
         self.assertEqual(len(self.storage.open_labels()), 1)
+
+    def test_cli_list_supports_argv_json_and_label_filter(self):
+        first = self.storage.start_label(100, "airflow_blocked", "intake")
+        self.storage.end_label(200, first)
+        self.storage.start_label(300, "gaming", "run")
+        with redirect_stdout(io.StringIO()) as out:
+            label_module.main(["--db", str(self.db), "list", "--all", "--label", "airflow_blocked", "--json"])
+        payload = json.loads(out.getvalue())
+        self.assertEqual(payload, [{
+            "id": first, "ts_start": 100, "ts_end": 200, "label": "airflow_blocked", "notes": "intake",
+        }])

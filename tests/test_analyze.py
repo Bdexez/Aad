@@ -12,6 +12,7 @@ import unittest
 from collector import analyze as analyze_module
 from collector.analyze import (
     analyze_dataset,
+    analyze_drift,
     audit_labels,
     compare_labels,
     correlate_metric,
@@ -284,6 +285,31 @@ class AnalyzeDatasetTest(unittest.TestCase):
             analyze_module.main(["--db", str(self.db), "--check-labels"])
         self.assertIn("Fenêtres vides : 1", out.getvalue())
         self.assertIn("1 mesure(s) multi-labels", out.getvalue())
+
+    def test_analyze_drift_detects_upward_trend_between_first_and_last_slices(self):
+        self.storage.insert_samples([
+            {"ts": 1000, "boot_id": "a", "temp_c": 40.0, "stuck": 5.0},
+            {"ts": 2000, "boot_id": "a", "temp_c": 42.0, "stuck": 5.0},
+            {"ts": 3000, "boot_id": "a", "temp_c": 44.0, "stuck": 5.0},
+            {"ts": 4000, "boot_id": "a", "temp_c": 60.0, "stuck": 5.0},
+            {"ts": 5000, "boot_id": "a", "temp_c": 62.0, "stuck": 5.0},
+            {"ts": 6000, "boot_id": "a", "temp_c": 64.0, "stuck": 5.0},
+        ])
+        drift = analyze_drift(self.db, slices=2)
+        self.assertEqual(drift["first_slice"]["samples"], 3)
+        self.assertEqual(drift["last_slice"]["samples"], 3)
+        self.assertEqual(drift["metrics"][0]["column"], "temp_c")
+        self.assertAlmostEqual(drift["metrics"][0]["delta_mean"], 20.0)
+        self.assertAlmostEqual(drift["metrics"][0]["z_drift"], 10.0)
+        self.assertIsNone(drift["metrics"][1]["z_drift"])
+
+        with self.assertRaises(ValueError):
+            analyze_drift(self.db, slices=1)
+
+        with redirect_stdout(io.StringIO()) as out:
+            analyze_module.main(["--db", str(self.db), "--drift", "--slices", "2"])
+        self.assertIn("Dérive temporelle", out.getvalue())
+        self.assertIn("temp_c", out.getvalue())
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import redirect_stderr, redirect_stdout
 import csv
 import io
+import json
 import pathlib
 import tempfile
 import unittest
@@ -83,3 +84,23 @@ class ExportCliTest(unittest.TestCase):
         self.assertEqual(error.exception.code, 2)
         self.assertFalse(missing.exists())
         self.assertFalse(path.exists())
+
+    def test_cli_supports_jsonl_and_events_export_and_rejects_mixed_flags(self):
+        with Storage(self.db, SCHEMA) as storage:
+            storage.add_event(150, "kmsg", "mce", "error", "err")
+        output, status = self.cli("--format", "jsonl", "--boot", "a")
+        records = [json.loads(line) for line in output.splitlines()]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["ts"], 100)
+        self.assertIn("1 mesure(s)", status)
+
+        ev_out, ev_status = self.cli("--events", "--format", "jsonl", "--kind", "mce")
+        ev_records = [json.loads(line) for line in ev_out.splitlines()]
+        self.assertEqual(len(ev_records), 1)
+        self.assertEqual(ev_records[0]["source"], "kmsg")
+        self.assertIn("1 événement(s)", ev_status)
+
+        for bad in (("--events", "--boot", "a"), ("--source", "kmsg")):
+            with self.subTest(bad=bad), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as err:
+                export_module.main(["--db", str(self.db), *bad])
+            self.assertEqual(err.exception.code, 2)

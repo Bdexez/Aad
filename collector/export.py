@@ -128,6 +128,78 @@ def export_jsonl(
         return count
 
 
+def export_downsampled(
+    db: str | pathlib.Path,
+    target: TextIO,
+    *,
+    bucket_ms: int,
+    fmt: str = "csv",
+    boot_id: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+    columns: Sequence[str] | None = None,
+) -> int:
+    """Exporte les moyennes des métriques numériques par fenêtre fixe `bucket_ms`.
+
+    L'agrégation reste dans SQLite (`GROUP BY boot_id, bucket_ts`) afin de
+    réduire 14 jours à 1 Hz en un fichier léger sans charger la table en RAM.
+    """
+    if bucket_ms <= 0:
+        raise ValueError("--bucket-ms doit être un entier > 0")
+    if fmt not in ("csv", "jsonl"):
+        raise ValueError(f"format non supporté: {fmt!r}")
+    validate_time_range(since, until)
+    where, params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
+    with read_snapshot(db) as conn:
+        fields = conn.execute("PRAGMA table_info(samples)").fetchall()
+        numeric = [
+            field[1]
+            for field in fields
+            if field[1] not in ("sample_id", "ts", "boot_id") and (field[2] or "").upper() != "TEXT"
+        ]
+        if columns is None:
+            selected = numeric
+        else:
+            selected = list(columns)
+            if not selected:
+                raise ValueError("aucune colonne numérique à agréger")
+            unknown = set(selected) - set(numeric)
+            if unknown:
+                raise ValueError(f"colonnes numériques inconnues: {', '.join(sorted(unknown))}")
+            if len(set(selected)) != len(selected):
+                raise ValueError("colonnes dupliquées")
+        header = ["bucket_ts", "boot_id", "sample_count", *selected]
+        aggs = ", ".join(f"AVG(s.{quote_identifier(col)})" for col in selected)
+        select_aggs = f", {aggs}" if aggs else ""
+        # Division entière SQLite (tronque vers 0) ; ajustement pour ts négatifs.
+        bucket_expr = (
+            "CASE WHEN s.ts >= 0 THEN (s.ts / ?) * ?"
+            " ELSE ((s.ts - ? + 1) / ?) * ? END"
+        )
+        sql = (
+            f"SELECT {bucket_expr} AS bucket_ts, s.boot_id, COUNT(*){select_aggs}"
+            f" FROM samples AS s{where}"
+            " GROUP BY s.boot_id, bucket_ts"
+            " ORDER BY bucket_ts, s.boot_id"
+        )
+        cursor = conn.execute(sql, [bucket_ms, bucket_ms, bucket_ms, bucket_ms, bucket_ms, *params])
+        count = 0
+        if fmt == "csv":
+            writer = csv.writer(target, lineterminator="\n")
+            writer.writerow(header)
+            for row in cursor:
+                writer.writerow(row)
+                count += 1
+        else:
+            for row in cursor:
+                target.write(
+                    json.dumps(dict(zip(header, row)), ensure_ascii=False, separators=(",", ":"))
+                    + "\n"
+                )
+                count += 1
+        return count
+
+
 def export_events(
     db: str | pathlib.Path,
     target: TextIO,
@@ -207,12 +279,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--since", type=int, help="epoch ms inclusif")
     parser.add_argument("--until", type=int, help="epoch ms exclusif")
     parser.add_argument("--columns", nargs="+", help="colonnes de mesures à exporter, dans l'ordre choisi")
+    parser.add_argument("--bucket-ms", type=int, help="ré-échantillonner par fenêtres de N ms (moyenne SQLite)")
     parser.add_argument("--source", help="filtrer les événements par source (avec --events)")
     parser.add_argument("--kind", help="filtrer les événements par genre (avec --events)")
     parser.add_argument("--severity", help="filtrer les événements par gravité (avec --events)")
     args = parser.parse_args(argv)
-    if args.events and (args.boot_id is not None or args.columns is not None):
-        parser.error("--boot et --columns ne s'appliquent pas à --events")
+    if args.events and (args.boot_id is not None or args.columns is not None or args.bucket_ms is not None):
+        parser.error("--boot, --columns et --bucket-ms ne s'appliquent pas à --events")
     if not args.events and any(v is not None for v in (args.source, args.kind, args.severity)):
         parser.error("--source, --kind et --severity nécessitent --events")
     try:
@@ -221,6 +294,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 count = export_events(
                     args.db, target, fmt=args.format, since=args.since, until=args.until,
                     source=args.source, kind=args.kind, severity=args.severity,
+                )
+            elif args.bucket_ms is not None:
+                count = export_downsampled(
+                    args.db, target, bucket_ms=args.bucket_ms, fmt=args.format,
+                    boot_id=args.boot_id, since=args.since, until=args.until,
+                    columns=args.columns,
                 )
             elif args.format == "jsonl":
                 count = export_jsonl(
@@ -235,8 +314,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             target.flush()
     except (ValueError, OSError, sqlite3.Error) as exc:
         parser.error(f"export impossible: {exc}")
-    noun = "événement(s)" if args.events else "mesure(s)"
-    print(f"{count} {noun} exporté(s)" if args.events else f"{count} {noun} exportée(s)", file=sys.stderr)
+    if args.events:
+        print(f"{count} événement(s) exporté(s)", file=sys.stderr)
+    elif args.bucket_ms is not None:
+        print(f"{count} fenêtre(s) exportée(s)", file=sys.stderr)
+    else:
+        print(f"{count} mesure(s) exportée(s)", file=sys.stderr)
 
 
 if __name__ == "__main__":

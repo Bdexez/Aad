@@ -1,10 +1,10 @@
-![BAD — Linux telemetry, context included](docs/visuals/cover.svg)
+![AAD — Linux telemetry, context included](docs/visuals/cover.svg)
 
-# BAD · Bdex Anomaly Detector
+# AAD · Arch Anomaly Detector
 
 **Build a hardware anomaly dataset that explains what the machine was doing.**
 
-BAD collects Linux hardware telemetry, workload context and fault events into a local SQLite database. It is designed for labelled experiments around cooling, airflow and system instability, with a collector that keeps running when an optional source is unavailable.
+AAD collects Linux hardware telemetry, workload context and fault events into a local SQLite database. It is designed for labelled experiments around cooling, airflow and system instability, with a collector that keeps running when an optional source is unavailable.
 
 `Python 3.10+` · `Linux /proc + /sys` · `SQLite WAL` · `No required third-party packages`
 
@@ -44,7 +44,7 @@ python -m collector.label list
 python -m collector.label list --all
 ```
 
-For unattended collection, see the [systemd unit](systemd/bad-collector.service). Optional NVIDIA support uses `nvidia-ml-py`; the rest of the collector can run with the standard library.
+For unattended collection, see the [systemd unit](systemd/aad-collector.service). Optional NVIDIA support uses `nvidia-ml-py`; the rest of the collector can run with the standard library.
 
 `label list --all` includes completed experiments, their boundaries and notes. Empty labels and end times before the start are rejected. Ending several windows validates them together, so an invalid time closes none of them.
 

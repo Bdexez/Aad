@@ -1,3 +1,3 @@
-"""BAD — Bdex Anomaly Detector : collecte de télémétrie matérielle à 1 Hz."""
+"""AAD — Arch Anomaly Detector : collecte de télémétrie matérielle à 1 Hz."""
 
 __version__ = "0.1.0"

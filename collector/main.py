@@ -424,7 +424,7 @@ def run_scan(top: int = 6) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="BAD — collecte de télémétrie matérielle")
+    ap = argparse.ArgumentParser(description="AAD — collecte de télémétrie matérielle")
     ap.add_argument("--db", default="data/metrics.db")
     ap.add_argument("--period", type=float, default=1.0, help="secondes entre deux samples")
     ap.add_argument("--duration", type=float, help="arrêt automatique après N secondes")

@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🩺 BAD — Bdex Anomaly Detector
+# 🩺 AAD — Arch Anomaly Detector
 
 **Hardware telemetry at 1 Hz on Linux, to build a labelled dataset and train an
 anomaly detector on it.**
@@ -86,11 +86,11 @@ sudo python -m collector.main --db data/metrics.db --period 1.0
 python -m collector.main --db /tmp/trial.db --period 0.5 --duration 30 -v
 ```
 
-> 🛠️ **As a service**: see [`systemd/bad-collector.service`](../systemd/bad-collector.service).
+> 🛠️ **As a service**: see [`systemd/aad-collector.service`](../systemd/aad-collector.service).
 
-The unit expects the repository at `/opt/bad`. Install it there before copying
-and enabling the service. systemd creates `/var/lib/bad` at startup and preserves
-it when the service stops; collection writes to `/var/lib/bad/metrics.db`.
+The unit expects the repository at `/opt/aad`. Install it there before copying
+and enabling the service. systemd creates `/var/lib/aad` at startup and preserves
+it when the service stops; collection writes to `/var/lib/aad/metrics.db`.
 Pass that same `--db` path to annotation, report, export and backup commands
 when working with the service's dataset.
 
@@ -501,7 +501,7 @@ baseline is available. An aggregate is unknown if any discovered member is
 unreadable, preventing recovery from producing a false error spike. Interrupt
 counters share one `/proc/interrupts` snapshot per tick.
 
-For PCIe AER, BAD sums the detailed error indicators and excludes the
+For PCIe AER, AAD sums the detailed error indicators and excludes the
 `TOTAL_ERR_*` notification counters. The kernel documents that one notification
 can contain several indicators; adding both would mix and inflate the counts.
 See the [kernel AER ABI](https://www.kernel.org/doc/html/latest/admin-guide/abi-testing.html).

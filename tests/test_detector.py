@@ -74,6 +74,18 @@ class BaselineDetectorTest(unittest.TestCase):
         self.assertAlmostEqual(ev["recall"], 1.0)
         self.assertAlmostEqual(ev["f1"], 1.0)
 
+    def test_episodes_attach_correlated_events_within_margin(self):
+        self.seed_experiment()
+        self.storage.add_event(1000, "kmsg", "unrelated", "info", "too early")
+        self.storage.add_event(15500, "kmsg", "thermal_trip", "critical", "core temp high")
+        res = detect_anomalies(
+            self.db, baseline_label="normal", since=11000, threshold=4.0, min_samples=3, event_margin_ms=2000,
+        )
+        events = res["episodes"][0]["events"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["kind"], "thermal_trip")
+        self.assertEqual(events[0]["ts"], 15500)
+
     def test_boot_boundary_splits_episodes_and_std_fallback_works_when_mad_is_zero(self):
         # 5 zéros et 1 valeur à 1.0 -> median=0, mad=0, std>0 (repli sur std).
         self.storage.insert_samples([

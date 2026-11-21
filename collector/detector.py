@@ -30,6 +30,68 @@ class FeatureBaseline:
     present: int
 
 
+def save_baseline_model(
+    path: str | pathlib.Path,
+    baseline_meta: dict,
+    features: Sequence[FeatureBaseline],
+) -> pathlib.Path:
+    """Enregistre un modèle de référence en JSON (refuse d'écraser un fichier existant)."""
+    target = pathlib.Path(path)
+    payload = {
+        "version": 1,
+        "baseline": baseline_meta,
+        "features": [
+            {
+                "column": f.column,
+                "center": f.center,
+                "scale": f.scale,
+                "method": f.method,
+                "present": f.present,
+            }
+            for f in features
+        ],
+    }
+    stream = target.open("x", encoding="utf-8")
+    try:
+        with stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+    except BaseException:
+        target.unlink(missing_ok=True)
+        raise
+    return target
+
+
+def load_baseline_model(path: str | pathlib.Path) -> tuple[dict, list[FeatureBaseline]]:
+    """Charge et valide un modèle de référence JSON."""
+    raw = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+        raise ValueError("modèle de référence invalide ou version non supportée")
+    items = raw.get("features")
+    if not isinstance(items, list) or not items:
+        raise ValueError("le modèle ne contient aucune métrique")
+    features: list[FeatureBaseline] = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("entrée de métrique invalide dans le modèle")
+        col = item.get("column")
+        center = item.get("center")
+        scale = item.get("scale")
+        method = item.get("method")
+        present = item.get("present", 0)
+        if (
+            not isinstance(col, str)
+            or not isinstance(center, (int, float)) or not math.isfinite(center)
+            or not isinstance(scale, (int, float)) or not math.isfinite(scale) or scale <= 0
+            or method not in ("mad", "std")
+            or not isinstance(present, int) or present < 0
+        ):
+            raise ValueError(f"paramètres invalides pour la métrique {col!r}")
+        features.append(FeatureBaseline(col, float(center), float(scale), method, present))
+    meta = raw.get("baseline") if isinstance(raw.get("baseline"), dict) else {}
+    return meta, features
+
+
 def _label_exists_clause(label: str) -> tuple[str, list[str]]:
     return (
         "EXISTS (SELECT 1 FROM labels AS l WHERE l.label = ?"
@@ -126,8 +188,10 @@ def detect_anomalies(
     min_samples: int = 3,
     top_contributors: int = 3,
     event_margin_ms: int = 5000,
+    load_model: str | pathlib.Path | None = None,
+    save_model: str | pathlib.Path | None = None,
 ) -> dict:
-    """Ajuste une référence robuste et détecte les épisodes anormaux sur la cible."""
+    """Ajuste ou charge une référence robuste et détecte les épisodes anormaux."""
     if not math.isfinite(threshold) or threshold <= 0:
         raise ValueError("--threshold doit être un nombre fini > 0")
     if min_samples < 1:
@@ -136,6 +200,8 @@ def detect_anomalies(
         raise ValueError("top_contributors doit être >= 1")
     if event_margin_ms < 0:
         raise ValueError("--event-margin-ms doit être >= 0")
+    if load_model is not None and save_model is not None:
+        raise ValueError("--load-model et --save-model sont mutuellement exclusifs")
     validate_time_range(baseline_since, baseline_until)
     validate_time_range(since, until)
     if baseline_label is not None:
@@ -171,7 +237,31 @@ def detect_anomalies(
         else:
             selected = numeric_names
 
-        baseline_count, fitted, skipped = _fit_baseline(conn, selected, base_where, base_params)
+        if load_model is not None:
+            loaded_meta, loaded_features = load_baseline_model(load_model)
+            selected_set = set(selected)
+            fitted = [fb for fb in loaded_features if fb.column in selected_set]
+            skipped = [fb.column for fb in loaded_features if fb.column not in selected_set]
+            if not fitted:
+                raise ValueError("aucune métrique du modèle n'est présente dans la base cible")
+            baseline_meta = {
+                **loaded_meta,
+                "loaded_from": str(load_model),
+                "features_used": len(fitted),
+                "features_skipped": skipped,
+            }
+        else:
+            baseline_count, fitted, skipped = _fit_baseline(conn, selected, base_where, base_params)
+            baseline_meta = {
+                "label": baseline_label,
+                "boot_id": baseline_boot,
+                "window": {"since": baseline_since, "until": baseline_until},
+                "samples": baseline_count,
+                "features_used": len(fitted),
+                "features_skipped": skipped,
+            }
+            if save_model is not None:
+                save_baseline_model(save_model, baseline_meta, fitted)
 
         projection = ", ".join(f"s.{quote_identifier(fb.column)}" for fb in fitted)
         eval_select = ""
@@ -320,14 +410,7 @@ def detect_anomalies(
                 ep["events"] = []
 
     result = {
-        "baseline": {
-            "label": baseline_label,
-            "boot_id": baseline_boot,
-            "window": {"since": baseline_since, "until": baseline_until},
-            "samples": baseline_count,
-            "features_used": len(fitted),
-            "features_skipped": skipped,
-        },
+        "baseline": baseline_meta,
         "target": {
             "label": target_label,
             "boot_id": boot_id,
@@ -369,13 +452,18 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="longueur minimale d'un épisode anormal (défaut : 3)")
     parser.add_argument("--event-margin-ms", type=int, default=5000,
                         help="marge (ms) pour associer les événements autour d'un épisode (défaut : 5000)")
+    parser.add_argument("--save-model", type=pathlib.Path, help="sauvegarder le modèle ajusté en JSON")
+    parser.add_argument("--load-model", type=pathlib.Path, help="charger un modèle JSON existant")
     parser.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
     args = parser.parse_args(argv)
 
-    if not any(v is not None for v in (
+    has_baseline_opts = any(v is not None for v in (
         args.baseline_label, args.baseline_boot, args.baseline_since, args.baseline_until
-    )):
-        parser.error("spécifiez une référence (--baseline-label, --baseline-boot ou --baseline-since/--baseline-until)")
+    ))
+    if args.load_model is not None and has_baseline_opts:
+        parser.error("--load-model ne se combine pas avec les options --baseline-*")
+    if args.load_model is None and not has_baseline_opts:
+        parser.error("spécifiez une référence (--baseline-label, --baseline-boot, --baseline-since/--baseline-until ou --load-model)")
 
     try:
         result = detect_anomalies(
@@ -393,6 +481,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             threshold=args.threshold,
             min_samples=args.min_samples,
             event_margin_ms=args.event_margin_ms,
+            load_model=args.load_model,
+            save_model=args.save_model,
         )
     except (ValueError, OSError, sqlite3.Error) as exc:
         parser.error(str(exc))

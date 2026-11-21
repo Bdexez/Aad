@@ -140,6 +140,24 @@ class BaselineDetectorTest(unittest.TestCase):
         self.assertEqual(exc.exception.code, 2)
         self.assertIn("référence", err.getvalue())
 
+    def test_save_and_load_baseline_model_roundtrip_and_no_overwrite(self):
+        self.seed_experiment()
+        model_path = self.db.with_name("baseline.json")
+        first = detect_anomalies(
+            self.db, baseline_label="normal", since=11000, save_model=model_path,
+        )
+        self.assertTrue(model_path.exists())
+        # Refus d'écraser un modèle existant
+        with self.assertRaises(FileExistsError):
+            detect_anomalies(self.db, baseline_label="normal", since=11000, save_model=model_path)
+
+        second = detect_anomalies(
+            self.db, load_model=model_path, since=11000, eval_label="airflow_blocked",
+        )
+        self.assertEqual(len(second["episodes"]), len(first["episodes"]))
+        self.assertAlmostEqual(second["evaluation"]["f1"], 1.0)
+        self.assertEqual(second["baseline"]["loaded_from"], str(model_path))
+
 
 if __name__ == "__main__":
     unittest.main()

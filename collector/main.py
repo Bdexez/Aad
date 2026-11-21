@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+import json
 import logging
 import math
 import os
@@ -320,71 +321,134 @@ def _cpu_model() -> str:
     return platform.machine()
 
 
-def run_doctor() -> None:
+def collect_doctor_info() -> dict:
+    """Inspecte les sources et capacités de détection exposées par la machine."""
+    hwmon = sorted(list_hwmon())
+    readers_info: list[dict] = []
+    counters = None
+    kmsg = None
+    try:
+        for reader in candidate_readers(boot="doctor"):
+            try:
+                ok = reader.setup()
+            except Exception as exc:
+                readers_info.append({
+                    "name": reader.name,
+                    "status": "error",
+                    "fields": [],
+                    "error": str(exc),
+                })
+                close_reader(reader)
+                continue
+            if isinstance(reader, R.ErrorCounterReader) and ok:
+                counters = reader
+            if isinstance(reader, R.KmsgReader):
+                kmsg = reader
+            readers_info.append({
+                "name": reader.name,
+                "status": "ok" if ok else "unavailable",
+                "fields": list(reader.fields) if ok else [],
+                "error": None,
+            })
+            if reader is not counters and reader is not kmsg:
+                close_reader(reader)
+
+        kinds = error_catalogue.catalogue()
+        if kmsg is not None and kmsg.backend is not None:
+            kmsg_info: dict = {
+                "available": True,
+                "backend": kmsg.backend.name,
+                "backfilled": kmsg.backfilled,
+                "reason": None,
+            }
+        else:
+            kmsg_info = {
+                "available": False,
+                "backend": None,
+                "backfilled": 0,
+                "reason": kmsg.unavailable_reason if kmsg else "reader absent",
+            }
+        counters_info = {
+            "active": [
+                {"field": field, "note": note.splitlines()[0]}
+                for field, note in counters.describe()
+            ] if counters is not None else [],
+            "missing": counters.missing() if counters is not None else [],
+        }
+    finally:
+        for reader in (kmsg, counters):
+            if reader is not None:
+                close_reader(reader)
+
+    return {
+        "machine": platform.node(),
+        "kernel": platform.release(),
+        "cpu": _cpu_model(),
+        "hwmon": hwmon,
+        "is_root": os.geteuid() == 0,
+        "readers": readers_info,
+        "error_detection": {
+            "rules": len(error_catalogue.RULES),
+            "kinds": len(kinds),
+            "catch_all_level": error_catalogue.KERNEL_ERROR_LEVEL,
+            "kmsg": kmsg_info,
+            "counters": counters_info,
+        },
+    }
+
+
+def run_doctor(*, as_json: bool = False) -> None:
     """`--doctor` : ce que cette machine permet de mesurer et de détecter.
 
     À lancer sur chaque machine : la couverture n'est pas la même partout, et
     c'est cette sortie qui le dit — y compris ce qui N'EST PAS surveillé.
     """
-    print(f"Machine   {platform.node()} · noyau {platform.release()}")
-    print(f"CPU       {_cpu_model()}")
-    print(f"hwmon     {', '.join(sorted(list_hwmon())) or 'aucun'}")
-    print(f"Droits    {'root' if os.geteuid() == 0 else 'utilisateur ordinaire'}")
+    info = collect_doctor_info()
+    if as_json:
+        print(json.dumps(info, ensure_ascii=False, indent=2))
+        return
+
+    print(f"Machine   {info['machine']} · noyau {info['kernel']}")
+    print(f"CPU       {info['cpu']}")
+    print(f"hwmon     {', '.join(info['hwmon']) or 'aucun'}")
+    print(f"Droits    {'root' if info['is_root'] else 'utilisateur ordinaire'}")
 
     print("\nSources de métriques")
-    counters = None
-    kmsg = None
-    for reader in candidate_readers(boot="doctor"):
-        try:
-            ok = reader.setup()
-        except Exception as exc:
-            print(f"  [!!] {reader.name:14} erreur de configuration: {exc}")
-            close_reader(reader)
+    for reader in info["readers"]:
+        if reader["status"] == "error":
+            print(f"  [!!] {reader['name']:14} erreur de configuration: {reader['error']}")
             continue
-        if isinstance(reader, R.ErrorCounterReader) and ok:
-            counters = reader
-        if isinstance(reader, R.KmsgReader):
-            kmsg = reader
+        ok = reader["status"] == "ok"
         marker = "OK" if ok else "--"
-        detail = ", ".join(reader.fields) if ok else "absent de cette machine"
-        print(f"  [{marker}] {reader.name:14} {detail[:96]}")
-        if reader is not counters and reader is not kmsg:
-            close_reader(reader)
+        detail = ", ".join(reader["fields"]) if ok else "absent de cette machine"
+        print(f"  [{marker}] {reader['name']:14} {detail[:96]}")
 
+    det = info["error_detection"]
     print("\nDétection d'erreurs")
-    kinds = error_catalogue.catalogue()
-    print(f"  Étage 1  messages noyau : {len(error_catalogue.RULES)} règles, {len(kinds)} genres")
-    if kmsg is not None and kmsg.backend is not None:
-        print(f"           source active : {kmsg.backend.name}")
-        print(f"           tampon du boot courant : {kmsg.backfilled} erreur(s)")
+    print(f"  Étage 1  messages noyau : {det['rules']} règles, {det['kinds']} genres")
+    kmsg = det["kmsg"]
+    if kmsg["available"]:
+        print(f"           source active : {kmsg['backend']}")
+        print(f"           tampon du boot courant : {kmsg['backfilled']} erreur(s)")
     else:
-        reason = kmsg.unavailable_reason if kmsg else "reader absent"
-        print(f"           INDISPONIBLE : {reason}")
-    print(f"  Étage 2  attrape-tout : toute erreur noyau de priorité <= "
-          f"{error_catalogue.KERNEL_ERROR_LEVEL} non classée")
-    if counters is not None:
-        print(f"  Étage 3  compteurs matériels : {len(counters.counters)} actifs")
-        for field, note in counters.describe():
-            print(f"           {field:20} {note.splitlines()[0][:70]}")
-        absent = counters.missing()
+        print(f"           INDISPONIBLE : {kmsg['reason']}")
+    print(f"  Étage 2  attrape-tout : toute erreur noyau de priorité <= {det['catch_all_level']} non classée")
+    active_counters = det["counters"]["active"]
+    if active_counters:
+        print(f"  Étage 3  compteurs matériels : {len(active_counters)} actifs")
+        for item in active_counters:
+            print(f"           {item['field']:20} {item['note'][:70]}")
+        absent = det["counters"]["missing"]
         if absent:
             print(f"           non exposés ici : {', '.join(absent)}")
     else:
         print("  Étage 3  compteurs matériels : aucun")
 
-    for reader in (kmsg, counters):
-        if reader is not None:
-            close_reader(reader)
 
-
-def run_scan(top: int = 6) -> None:
-    """`--scan` : classe tout le tampon noyau du boot courant, sans écrire en base.
-
-    C'est l'outil à lancer sur chaque machine pour voir *ce qui est réellement
-    détecté* — et pour repérer un faux positif avant qu'il ne pollue 14 jours
-    de dataset.
-    """
+def collect_scan_results() -> dict:
+    """Classe tout le tampon noyau du boot courant, sans écrire en base."""
     found: list[tuple[str, str, str]] = []
+    unavailable: list[dict[str, str]] = []
 
     def collect(source, kind, severity, message, ts=None, dedup=None):
         found.append((kind, severity, message))
@@ -395,15 +459,11 @@ def run_scan(top: int = 6) -> None:
         try:
             if not reader.setup():
                 reason = getattr(reader, "unavailable_reason", "") or "indisponible"
-                print(f"[--] {reader.name}: {reason}")
+                unavailable.append({"reader": reader.name, "status": "unavailable", "reason": reason})
         except Exception as exc:
-            print(f"[!!] {reader.name}: {exc}")
+            unavailable.append({"reader": reader.name, "status": "error", "reason": str(exc)})
         finally:
             close_reader(reader)
-
-    if not found:
-        print("Aucune erreur détectée sur le boot courant.")
-        return
 
     groups: dict[str, list[tuple[str, str]]] = {}
     for kind, severity, message in found:
@@ -413,17 +473,52 @@ def run_scan(top: int = 6) -> None:
     ranked = sorted(
         groups.items(), key=lambda kv: (order.get(kv[1][0][0], 2), -len(kv[1]))
     )
-    print(f"{len(found)} erreur(s) classée(s) sur le boot courant :\n")
-    for kind, entries in ranked:
-        severity = entries[0][0]
-        print(f"  {severity.upper():8} {kind:18} x{len(entries)}")
-        for _, message in entries[:top]:
-            print(f"           {message[:110]}")
-        if len(entries) > top:
-            print(f"           ... et {len(entries) - top} autre(s)")
     criticals = sum(1 for _, sev, _ in found if sev == error_catalogue.CRITICAL)
-    print(f"\nVerdict : {criticals} critique(s). "
-          + ("Rien de bloquant." if not criticals else "À examiner avant de collecter."))
+    return {
+        "total": len(found),
+        "criticals": criticals,
+        "unavailable": unavailable,
+        "groups": [
+            {
+                "kind": kind,
+                "severity": entries[0][0],
+                "count": len(entries),
+                "messages": [message for _, message in entries],
+            }
+            for kind, entries in ranked
+        ],
+    }
+
+
+def run_scan(top: int = 6, *, as_json: bool = False) -> None:
+    """`--scan` : classe tout le tampon noyau du boot courant, sans écrire en base.
+
+    C'est l'outil à lancer sur chaque machine pour voir *ce qui est réellement
+    détecté* — et pour repérer un faux positif avant qu'il ne pollue 14 jours
+    de dataset.
+    """
+    result = collect_scan_results()
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    for item in result["unavailable"]:
+        marker = "!!" if item["status"] == "error" else "--"
+        print(f"[{marker}] {item['reader']}: {item['reason']}")
+
+    if not result["total"]:
+        print("Aucune erreur détectée sur le boot courant.")
+        return
+
+    print(f"{result['total']} erreur(s) classée(s) sur le boot courant :\n")
+    for group in result["groups"]:
+        print(f"  {group['severity'].upper():8} {group['kind']:18} x{group['count']}")
+        for message in group["messages"][:top]:
+            print(f"           {message[:110]}")
+        if group["count"] > top:
+            print(f"           ... et {group['count'] - top} autre(s)")
+    print(f"\nVerdict : {result['criticals']} critique(s). "
+          + ("Rien de bloquant." if not result["criticals"] else "À examiner avant de collecter."))
 
 
 def main() -> None:
@@ -436,6 +531,8 @@ def main() -> None:
                     help="ce que cette machine permet de mesurer et de détecter, puis sortie")
     ap.add_argument("--scan", action="store_true",
                     help="classe les erreurs du boot courant sans rien écrire en base")
+    ap.add_argument("--json", action="store_true",
+                    help="sortie JSON (avec --doctor ou --scan)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -444,12 +541,15 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    if args.json and not (args.doctor or args.scan):
+        ap.error("--json nécessite --doctor ou --scan")
+
     if args.doctor:
-        run_doctor()
+        run_doctor(as_json=args.json)
         return
 
     if args.scan:
-        run_scan()
+        run_scan(as_json=args.json)
         return
 
     try:

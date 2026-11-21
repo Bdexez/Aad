@@ -282,6 +282,7 @@ sensor accuracy.
 python -m collector.analyze --db data/metrics.db
 python -m collector.analyze --db data/metrics.db --boot BOOT_ID --gap-factor 2.5 --json
 python -m collector.analyze --db data/metrics.db --compare normal airflow_blocked
+python -m collector.analyze --db data/metrics.db --correlate k10temp_tctl --min-pairs 10
 ```
 
 `collector.analyze` inspects a read-only SQLite snapshot without migrating the
@@ -299,6 +300,9 @@ database:
   between two labelled experiments, reporting `delta_mean`, standardized shift
   `z_shift = (target_mean - baseline_mean) / baseline_std`, and
   `overlap_samples` so mixed windows are visible immediately.
+- **Pairwise Pearson correlation (`--correlate COLUMN`)**: computes exact
+  pairwise `r` and `r_squared` inside SQLite over non-NULL intersections
+  (`--min-pairs`, default 3), ranked by `|r|`.
 
 ### Backing up during collection
 

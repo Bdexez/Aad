@@ -12,13 +12,8 @@ import sqlite3
 import sys
 from typing import TextIO
 
-from .database import read_snapshot
+from .database import read_snapshot, sample_filter_sql, validate_time_range
 from .storage import quote_identifier
-
-
-def _validate_range(since: int | None, until: int | None) -> None:
-    if since is not None and until is not None and until <= since:
-        raise ValueError("--until doit être supérieur à --since")
 
 
 def _iter_samples(
@@ -45,15 +40,7 @@ def _iter_samples(
         raise ValueError("la table samples doit avoir une clé primaire unique")
     key = f"s.{quote_identifier(primary[0])}"
     projection = ", ".join(f"s.{quote_identifier(field)}" for field in selected)
-    filters = []
-    params: list[str | int] = []
-    for value, condition in (
-        (boot_id, "s.boot_id = ?"), (since, "s.ts >= ?"), (until, "s.ts < ?"),
-    ):
-        if value is not None:
-            filters.append(condition)
-            params.append(value)
-    where = " WHERE " + " AND ".join(filters) if filters else ""
+    where, params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
     cursor = conn.execute(
         f"SELECT {key}, {projection}, l.id, l.ts_start, l.ts_end, l.label, l.notes"
         " FROM samples AS s LEFT JOIN labels AS l"
@@ -101,7 +88,7 @@ def export_csv(
     qui se chevauchent, leurs notes et leurs bornes ; [] n'invente aucun label.
     Les anciennes bases sont lisibles sans déclencher leur migration.
     """
-    _validate_range(since, until)
+    validate_time_range(since, until)
     with read_snapshot(db) as conn:
         selected, rows = _iter_samples(
             conn, boot_id=boot_id, since=since, until=until,
@@ -126,7 +113,7 @@ def export_jsonl(
     columns: Sequence[str] | None = None,
 ) -> int:
     """Écrit un objet JSON par mesure (JSON Lines), préservant les types natifs."""
-    _validate_range(since, until)
+    validate_time_range(since, until)
     with read_snapshot(db) as conn:
         selected, rows = _iter_samples(
             conn, boot_id=boot_id, since=since, until=until,
@@ -155,7 +142,7 @@ def export_events(
     """Exporte la table `events` en CSV ou JSONL depuis un snapshot lecture seule."""
     if fmt not in ("csv", "jsonl"):
         raise ValueError(f"format non supporté: {fmt!r}")
-    _validate_range(since, until)
+    validate_time_range(since, until)
     with read_snapshot(db) as conn:
         fields = [field[1] for field in conn.execute("PRAGMA table_info(events)").fetchall()]
         if not {"ts", "source", "kind"} <= set(fields):

@@ -5,7 +5,7 @@ import sqlite3
 import tempfile
 import unittest
 
-from collector.database import read_snapshot
+from collector.database import read_snapshot, sample_filter_sql, validate_time_range
 from collector.main import SCHEMA
 from collector.storage import Storage
 
@@ -45,3 +45,15 @@ class ReadSnapshotTest(unittest.TestCase):
             with read_snapshot(missing):
                 self.fail("missing database was opened")
         self.assertFalse(missing.parent.exists())
+
+    def test_validate_time_range_and_sample_filter_sql(self):
+        validate_time_range(None, None)
+        validate_time_range(10, 20)
+        for since, until in ((10, 10), (20, 10)):
+            with self.subTest(since=since, until=until), self.assertRaises(ValueError):
+                validate_time_range(since, until)
+        self.assertEqual(sample_filter_sql(), ("", []))
+        self.assertEqual(
+            sample_filter_sql(boot_id="b", since=10, until=20, alias="s"),
+            (" WHERE s.boot_id = ? AND s.ts >= ? AND s.ts < ?", ["b", 10, 20]),
+        )

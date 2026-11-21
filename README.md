@@ -65,13 +65,25 @@ Check the dataset before exporting or training:
 
 ```bash
 python -m collector.report --db data/metrics.db
-python -m collector.report --db data/metrics.db --json
+python -m collector.report --db data/metrics.db --boot BOOT_ID --json
 python -m collector.report --db data/metrics.db --since 1794300000000 --until 1794386400000
 ```
 
 The report shows metric completeness, annotation coverage, sample windows per boot, repeated timestamps and grouped fault events. It reads a consistent snapshot without modifying the database; overlapping experiment labels count each sample once. These are data quality facts, not inferred anomaly scores.
 
-Use `--since` and `--until` to check the same inclusive/exclusive time window as an export. Metric coverage and events are limited to that window; annotation counts include non-empty experiment windows that intersect it. JSON output records the requested bounds in `window`.
+Use `--boot`, `--since` and `--until` to check the same boot or inclusive/exclusive time window as an export. Metric coverage and boot summaries are limited to that scope; annotation counts include non-empty experiment windows that intersect the time range. JSON output records the requested bounds in `window` and `boot_id`.
+
+## Explore dataset statistics
+
+Inspect sampling cadence, numeric distributions, constant sensors and experiment shifts before modeling:
+
+```bash
+python -m collector.analyze --db data/metrics.db
+python -m collector.analyze --db data/metrics.db --compare normal airflow_blocked
+python -m collector.analyze --db data/metrics.db --boot BOOT_ID --json
+```
+
+The analyzer runs on a read-only SQLite snapshot without migrating the database. It reports per-boot sampling intervals (median, p95, gaps, duplicate timestamps and clock regressions), SQL-computed numeric `min`/`max`/`mean`/`std` with constant-sensor flags, per-label sample and event counts, and standardized shifts (`z_shift`) between two labelled experiments.
 
 ## Back up an active collection
 
@@ -138,6 +150,7 @@ The suite exercises fake `/proc` and `/sys` trees, sensor discovery, counter wra
 | [`collector/label.py`](collector/label.py) | Experiment annotation CLI |
 | [`collector/export.py`](collector/export.py) | Read-only CSV export with experiment annotations |
 | [`collector/report.py`](collector/report.py) | Dataset completeness and annotation coverage |
+| [`collector/analyze.py`](collector/analyze.py) | Exploratory statistics, cadence diagnostics and label comparison |
 | [`collector/backup.py`](collector/backup.py) | Consistent backup while collection continues |
 
 Coverage is hardware-dependent. Software counters cannot expose every physical failure, and heuristic workload labels need interpretation. The [complete reference](docs/REFERENCE.md) documents measurement limits, experiment protocols and machine-specific coverage.

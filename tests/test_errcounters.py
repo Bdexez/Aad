@@ -39,6 +39,17 @@ class InterruptParsingTest(unittest.TestCase):
     def test_missing_file(self):
         self.assertEqual(_interrupt_totals(pathlib.Path("/absent")), {})
 
+    def test_malformed_dash_tokens_do_not_crash_interrupt_or_vmstat_parsing(self):
+        path = write(
+            pathlib.Path(self.tmp.name) / "weird_interrupts",
+            " NMI: 2 --1 Non-maskable interrupts\n",
+        )
+        self.assertEqual(_interrupt_totals(path)["NMI"], 2)
+        proc = pathlib.Path(self.tmp.name) / "proc_weird"
+        write(proc / "vmstat", "bad_line --5\noom_kill 3\n")
+        reader = ErrorCounterReader(proc=proc, sys_root=pathlib.Path(self.tmp.name) / "empty_sys")
+        self.assertEqual(reader._vmstat(), {"oom_kill": 3})
+
 
 class CounterTest(unittest.TestCase):
     def setUp(self):

@@ -89,6 +89,17 @@ class CounterTest(unittest.TestCase):
         baseline = [e for e in self.emitted if "au démarrage" in e[3]]
         self.assertTrue(any("err_nmi=5" in e[3] for e in baseline))
 
+    def test_startup_baseline_event_has_stable_per_boot_dedup_key(self):
+        first = ErrorCounterReader(proc=self.proc, sys_root=self.sys, boot="boot-1")
+        second = ErrorCounterReader(proc=self.proc, sys_root=self.sys, boot="boot-2")
+        events_1, events_2 = [], []
+        first.emitter = lambda *args: (events_1.append(args), True)[1]
+        second.emitter = lambda *args: (events_2.append(args), True)[1]
+        first.setup()
+        second.setup()
+        self.assertEqual(events_1[0][5], "boot-1:errcounters:init:err_nmi")
+        self.assertEqual(events_2[0][5], "boot-2:errcounters:init:err_nmi")
+
     def test_zero_counter_stays_silent(self):
         reader = self.reader()
         reader.setup()

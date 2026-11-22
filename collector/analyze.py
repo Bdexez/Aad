@@ -1398,6 +1398,149 @@ def detect_clipping(
     }
 
 
+def _fit_ols_sql(
+    conn: sqlite3.Connection,
+    temp_col: str,
+    power_col: str,
+    where: str,
+    params: Sequence[str | int],
+    min_pairs: int,
+) -> dict:
+    qt = quote_identifier(temp_col)
+    qp = quote_identifier(power_col)
+    cond = f"{qt} IS NOT NULL AND {qp} IS NOT NULL"
+    n, mt, mp, max_t, max_p = conn.execute(
+        f"SELECT COUNT(CASE WHEN {cond} THEN 1 END),"
+        f" AVG(CASE WHEN {cond} THEN {qt} END),"
+        f" AVG(CASE WHEN {cond} THEN {qp} END),"
+        f" MAX(CASE WHEN {cond} THEN {qt} END),"
+        f" MAX(CASE WHEN {cond} THEN {qp} END)"
+        f" FROM samples AS s{where}",
+        params,
+    ).fetchone()
+    r_th = None
+    t_idle = None
+    r_sq = None
+    if n >= min_pairs and mt is not None and mp is not None:
+        sxy, sxx, syy = conn.execute(
+            f"SELECT SUM(CASE WHEN {cond} THEN ({qp} - ?) * ({qt} - ?) END),"
+            f" SUM(CASE WHEN {cond} THEN ({qp} - ?) * ({qp} - ?) END),"
+            f" SUM(CASE WHEN {cond} THEN ({qt} - ?) * ({qt} - ?) END)"
+            f" FROM samples AS s{where}",
+            [mp, mt, mp, mp, mt, mt, *params],
+        ).fetchone()
+        if sxy is not None and sxx is not None and sxx > 0.0:
+            r_th = sxy / sxx
+            t_idle = mt - r_th * mp
+            if syy is not None and syy > 0.0:
+                r = max(-1.0, min(1.0, sxy / math.sqrt(sxx * syy)))
+                r_sq = r * r
+    return {
+        "pairs": n,
+        "r_th_c_per_w": r_th,
+        "t_idle_c": t_idle,
+        "r_squared": r_sq,
+        "mean_temp": mt,
+        "mean_power": mp,
+        "max_temp": max_t,
+        "max_power": max_p,
+    }
+
+
+def thermal_profile(
+    db: str | pathlib.Path,
+    temp_column: str,
+    power_column: str,
+    *,
+    boot_id: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+    min_pairs: int = 3,
+) -> dict:
+    """Estime la résistance thermique effective R_th (°C/W) : temp ≈ T_idle + R_th * power."""
+    if min_pairs < 2:
+        raise ValueError("--min-pairs doit être >= 2")
+    validate_time_range(since, until)
+    where, params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
+    with read_snapshot(db) as conn:
+        metrics, _ = _numeric_metrics(conn)
+        numeric_names = {name for name, _ in metrics}
+        for col in (temp_column, power_column):
+            if col not in numeric_names:
+                raise ValueError(f"métrique numérique introuvable: {col!r}")
+        overall = _fit_ols_sql(conn, temp_column, power_column, where, params, min_pairs)
+        boots = [
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT s.boot_id FROM samples AS s" + where + " ORDER BY s.boot_id",
+                params,
+            )
+        ]
+        per_boot = []
+        for b in boots:
+            bw, bp = sample_filter_sql(boot_id=b, since=since, until=until, alias="s")
+            per_boot.append({"boot_id": b, **_fit_ols_sql(conn, temp_column, power_column, bw, bp, min_pairs)})
+    return {
+        "boot_id": boot_id,
+        "window": {"since": since, "until": until},
+        "temp_column": temp_column,
+        "power_column": power_column,
+        "overall": overall,
+        "per_boot": per_boot,
+    }
+
+
+def compare_boots(
+    db: str | pathlib.Path,
+    baseline_boot: str,
+    target_boot: str,
+    *,
+    since: int | None = None,
+    until: int | None = None,
+) -> dict:
+    """Compare la distribution des métriques numériques entre deux boots distincts."""
+    baseline_boot = baseline_boot.strip()
+    target_boot = target_boot.strip()
+    if not baseline_boot or not target_boot:
+        raise ValueError("les boot_id à comparer ne peuvent pas être vides")
+    validate_time_range(since, until)
+    b_where, b_params = sample_filter_sql(boot_id=baseline_boot, since=since, until=until, alias="s")
+    t_where, t_params = sample_filter_sql(boot_id=target_boot, since=since, until=until, alias="s")
+    with read_snapshot(db) as conn:
+        metrics, _ = _numeric_metrics(conn)
+        b_count = conn.execute("SELECT COUNT(*) FROM samples AS s" + b_where, b_params).fetchone()[0]
+        t_count = conn.execute("SELECT COUNT(*) FROM samples AS s" + t_where, t_params).fetchone()[0]
+        b_stats = _compute_numeric_stats(conn, metrics, b_count, b_where, b_params)
+        t_stats = _compute_numeric_stats(conn, metrics, t_count, t_where, t_params)
+
+    comparisons = []
+    for base, target in zip(b_stats, t_stats):
+        b_mean, b_std = base["mean"], base["std"]
+        t_mean, t_std = target["mean"], target["std"]
+        delta = None if b_mean is None or t_mean is None else t_mean - b_mean
+        z_shift = None if delta is None or b_std is None or b_std == 0.0 else delta / b_std
+        comparisons.append({
+            "column": base["column"],
+            "baseline_present": base["present"],
+            "baseline_mean": b_mean,
+            "baseline_std": b_std,
+            "target_present": target["present"],
+            "target_mean": t_mean,
+            "target_std": t_std,
+            "delta_mean": delta,
+            "z_shift": z_shift,
+        })
+    comparisons.sort(
+        key=lambda item: (item["z_shift"] is None, -(abs(item["z_shift"]) if item["z_shift"] is not None else 0.0), item["column"])
+    )
+    return {
+        "window": {"since": since, "until": until},
+        "baseline": {"boot_id": baseline_boot, "samples": b_count},
+        "target": {"boot_id": target_boot, "samples": t_count},
+        "metrics": comparisons,
+    }
+
+
 def _fmt(value: float | None, digits: int = 2) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
 
@@ -1492,6 +1635,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                       help="corrélation croisée décalée source[t-lag] -> target[t]")
     mode.add_argument("--clipping", action="store_true",
                       help="détecter les sondes saturées sur leur min ou max observé")
+    mode.add_argument("--thermal-profile", nargs=2, metavar=("TEMP", "POWER"),
+                      help="estimer la résistance thermique effective R_th (°C/W) par boot")
+    mode.add_argument("--compare-boots", nargs=2, metavar=("BOOT_A", "BOOT_B"),
+                      help="comparer les métriques numériques entre deux boots")
     output_fmt = parser.add_mutually_exclusive_group()
     output_fmt.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
     output_fmt.add_argument("--markdown", action="store_true",
@@ -1501,6 +1648,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.compare, args.correlate, args.outliers, args.check_labels,
         args.drift, args.by, args.check_bounds, args.stuck_runs, args.changepoints,
         args.collinear, args.missing_blocks, args.lag_correlate, args.clipping,
+        args.thermal_profile, args.compare_boots,
     )):
         parser.error("--markdown s'applique uniquement au mode exploratoire par défaut")
 
@@ -1571,6 +1719,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.db, boot_id=args.boot_id, since=since, until=until,
                 min_pct=args.clip_pct, columns=args.columns,
             )
+        elif args.thermal_profile:
+            result = thermal_profile(
+                args.db, args.thermal_profile[0], args.thermal_profile[1],
+                boot_id=args.boot_id, since=since, until=until, min_pairs=args.min_pairs,
+            )
+        elif args.compare_boots:
+            result = compare_boots(
+                args.db, args.compare_boots[0], args.compare_boots[1],
+                since=since, until=until,
+            )
         else:
             result = analyze_dataset(
                 args.db, boot_id=args.boot_id, since=since,
@@ -1585,6 +1743,31 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.markdown:
         print(format_markdown(result))
+        return
+
+    if args.thermal_profile:
+        ov = result["overall"]
+        print(
+            f"Profil thermique {result['temp_column']} vs {result['power_column']} — "
+            f"global : R_th={_fmt(ov['r_th_c_per_w'], 3)} °C/W, T_idle={_fmt(ov['t_idle_c'])} °C "
+            f"(r²={_fmt(ov['r_squared'], 3)}, n={ov['pairs']})"
+        )
+        for b in result["per_boot"]:
+            print(
+                f"  boot {b['boot_id']} : R_th={_fmt(b['r_th_c_per_w'], 3)} °C/W, "
+                f"T_idle={_fmt(b['t_idle_c'])} °C (r²={_fmt(b['r_squared'], 3)}, n={b['pairs']})"
+            )
+        return
+
+    if args.compare_boots:
+        b, t = result["baseline"], result["target"]
+        print(f"Comparaison boots : {b['boot_id']} ({b['samples']}) vs {t['boot_id']} ({t['samples']})")
+        for item in result["metrics"]:
+            print(
+                f"  {item['column']} : {_fmt(item['baseline_mean'])} ± {_fmt(item['baseline_std'])}"
+                f" → {_fmt(item['target_mean'])} ± {_fmt(item['target_std'])}"
+                f" (Δ={_fmt(item['delta_mean'])}, z={_fmt(item['z_shift'])})"
+            )
         return
 
     if args.clipping:

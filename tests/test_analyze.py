@@ -16,6 +16,7 @@ from collector.analyze import (
     analyze_drift,
     audit_labels,
     check_physical_bounds,
+    compare_boots,
     compare_labels,
     correlate_metric,
     detect_changepoints,
@@ -25,6 +26,7 @@ from collector.analyze import (
     detect_outliers,
     detect_stuck_runs,
     lag_correlate,
+    thermal_profile,
 )
 from collector.main import SCHEMA
 from collector.storage import Storage
@@ -480,6 +482,36 @@ class AnalyzeDatasetTest(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as out:
             analyze_module.main(["--db", str(self.db), "--clipping", "--clip-pct", "40"])
         self.assertIn("50.0 %", out.getvalue())
+
+    def test_thermal_profile_and_compare_boots_quantify_cooling_degradation(self):
+        self.storage.ensure_columns(["power_w"])
+        # Boot A (propre) : temp = 30 + 0.5 * power ; Boot B (encrassé) : temp = 30 + 0.9 * power
+        rows = [
+            {"ts": 1000, "boot_id": "clean", "power_w": 20.0, "temp_c": 40.0},
+            {"ts": 2000, "boot_id": "clean", "power_w": 40.0, "temp_c": 50.0},
+            {"ts": 3000, "boot_id": "clean", "power_w": 60.0, "temp_c": 60.0},
+            {"ts": 4000, "boot_id": "clogged", "power_w": 20.0, "temp_c": 48.0},
+            {"ts": 5000, "boot_id": "clogged", "power_w": 40.0, "temp_c": 66.0},
+            {"ts": 6000, "boot_id": "clogged", "power_w": 60.0, "temp_c": 84.0},
+        ]
+        self.storage.insert_samples(rows)
+        prof = thermal_profile(self.db, "temp_c", "power_w")
+        by_boot = {b["boot_id"]: b for b in prof["per_boot"]}
+        self.assertAlmostEqual(by_boot["clean"]["r_th_c_per_w"], 0.5)
+        self.assertAlmostEqual(by_boot["clean"]["t_idle_c"], 30.0)
+        self.assertAlmostEqual(by_boot["clogged"]["r_th_c_per_w"], 0.9)
+
+        diff = compare_boots(self.db, "clean", "clogged")
+        self.assertEqual(diff["metrics"][0]["column"], "temp_c")
+        self.assertAlmostEqual(diff["metrics"][0]["delta_mean"], 16.0)
+
+        with redirect_stdout(io.StringIO()) as out:
+            analyze_module.main(["--db", str(self.db), "--thermal-profile", "temp_c", "power_w"])
+        self.assertIn("R_th=0.500 °C/W", out.getvalue())
+
+        with redirect_stdout(io.StringIO()) as out:
+            analyze_module.main(["--db", str(self.db), "--compare-boots", "clean", "clogged"])
+        self.assertIn("Comparaison boots : clean", out.getvalue())
 
 
 if __name__ == "__main__":

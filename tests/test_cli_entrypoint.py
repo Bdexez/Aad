@@ -51,6 +51,10 @@ class UnifiedCliEntryPointTest(unittest.TestCase):
         self.assertEqual(payload["samples"]["count"], 2)
         self.assertGreater(payload["storage_projection"]["estimated_mib_per_day"], 0)
 
+        with redirect_stdout(io.StringIO()) as out:
+            cli_entry.main(["summary", "--db", str(self.db), "--markdown"])
+        self.assertIn("# Synthèse AAD — OK", out.getvalue())
+
     def test_unknown_command_exits_cleanly_with_code_2(self):
         with redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as exc:
             cli_entry.main(["does-not-exist"])

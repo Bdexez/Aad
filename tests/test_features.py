@@ -74,6 +74,20 @@ class FeatureEngineeringTest(unittest.TestCase):
             features_module.main(["--db", str(self.db), "--rolling", "1"])
         self.assertEqual(exc.exception.code, 2)
 
+    def test_chronological_split_ratios_assign_ordered_train_val_test(self):
+        self.storage.insert_samples([
+            {"ts": 1000 * (i + 1), "boot_id": "a", "temp_c": 40.0 + i} for i in range(10)
+        ])
+        out = io.StringIO()
+        self.assertEqual(
+            export_features(self.db, out, fmt="jsonl", columns=["temp_c"], split_ratios=(0.6, 0.2, 0.2)),
+            10,
+        )
+        splits = [json.loads(line)["split"] for line in out.getvalue().splitlines()]
+        self.assertEqual(splits, ["train"] * 6 + ["val"] * 2 + ["test"] * 2)
+        with self.assertRaises(ValueError):
+            export_features(self.db, io.StringIO(), split_ratios=(0.0, 0.0, 0.0))
+
 
 if __name__ == "__main__":
     unittest.main()

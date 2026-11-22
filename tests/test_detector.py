@@ -335,6 +335,23 @@ class BaselineDetectorTest(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             detect_anomalies(self.db, baseline_label="normal", since=11000, export_scores=scores_csv)
 
+    def test_roc_and_pr_auc_handle_perfect_tied_and_single_class_cases(self):
+        from collector.detector import _roc_pr_auc
+
+        self.assertEqual(_roc_pr_auc([(1.0, False), (2.0, False), (5.0, True), (6.0, True)]), (1.0, 1.0))
+        roc_tied, _ = _roc_pr_auc([(3.0, False), (3.0, True)])
+        self.assertAlmostEqual(roc_tied, 0.5)
+        self.assertEqual(_roc_pr_auc([(1.0, False), (2.0, False)]), (None, None))
+
+        self.seed_experiment()
+        res = detect_anomalies(
+            self.db, baseline_label="normal", since=11000, eval_label="airflow_blocked",
+        )
+        self.assertIsNotNone(res["evaluation"]["roc_auc"])
+        self.assertIsNotNone(res["evaluation"]["pr_auc"])
+        # 1 pic négatif isolé (90°C) devance les 4 positifs (82..88°C) -> AP exacte = (1/2+2/3+3/4+4/5)/4
+        self.assertAlmostEqual(res["evaluation"]["pr_auc"], (0.5 + 2 / 3 + 0.75 + 0.8) / 4)
+
 
 if __name__ == "__main__":
     unittest.main()

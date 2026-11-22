@@ -1229,6 +1229,89 @@ def detect_missing_blocks(
     }
 
 
+def lag_correlate(
+    db: str | pathlib.Path,
+    target_column: str,
+    source_column: str,
+    *,
+    boot_id: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+    max_lag: int = 10,
+    min_pairs: int = 3,
+) -> dict:
+    """Corrélation croisée décalée entre `source[t - lag]` et `target[t]` par boot.
+
+    Mesure le temps de réponse physique (ex. inertie thermique entre puissance
+    `rapl_pkg_watts` et température `k10temp_tctl`), sans jamais apparier entre
+    deux boots distincts.
+    """
+    if max_lag < 0:
+        raise ValueError("--max-lag doit être >= 0")
+    if min_pairs < 2:
+        raise ValueError("--min-pairs doit être >= 2")
+    validate_time_range(since, until)
+    where, params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
+    with read_snapshot(db) as conn:
+        metrics, order_col = _numeric_metrics(conn)
+        numeric_names = [name for name, _ in metrics]
+        for col in (target_column, source_column):
+            if col not in numeric_names:
+                raise ValueError(f"métrique numérique introuvable: {col!r}")
+        qt = quote_identifier(target_column)
+        qs = quote_identifier(source_column)
+        cursor = conn.execute(
+            f"SELECT s.boot_id, s.{qt}, s.{qs} FROM samples AS s{where}"
+            f" ORDER BY s.boot_id, s.{quote_identifier(order_col)}",
+            params,
+        )
+        per_boot: dict[str, list[tuple[float | None, float | None]]] = {}
+        for b, t_val, s_val in cursor:
+            per_boot.setdefault(b, []).append((t_val, s_val))
+
+    lags: list[dict] = []
+    for lag in range(max_lag + 1):
+        xs: list[float] = []
+        ys: list[float] = []
+        for series in per_boot.values():
+            for i in range(lag, len(series)):
+                y = series[i][0]
+                x = series[i - lag][1]
+                if x is not None and y is not None:
+                    xs.append(float(x))
+                    ys.append(float(y))
+        n = len(xs)
+        r: float | None = None
+        if n >= min_pairs:
+            mx = sum(xs) / n
+            my = sum(ys) / n
+            sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+            sxx = sum((x - mx) ** 2 for x in xs)
+            syy = sum((y - my) ** 2 for y in ys)
+            denom = math.sqrt(max(0.0, sxx) * max(0.0, syy))
+            if denom > 0.0:
+                r = max(-1.0, min(1.0, sxy / denom))
+        lags.append({
+            "lag": lag,
+            "pairs": n,
+            "r": r,
+            "r_squared": None if r is None else r * r,
+        })
+
+    valid = [item for item in lags if item["r"] is not None]
+    best = max(valid, key=lambda item: (abs(item["r"]), -item["lag"])) if valid else None
+    return {
+        "boot_id": boot_id,
+        "window": {"since": since, "until": until},
+        "target": target_column,
+        "source": source_column,
+        "max_lag": max_lag,
+        "min_pairs": min_pairs,
+        "best": best,
+        "lags": lags,
+    }
+
+
 def _fmt(value: float | None, digits: int = 2) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
 
@@ -1291,6 +1374,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="seuil |r| pour --collinear (défaut : 0.95)")
     parser.add_argument("--min-missing", type=int, default=5,
                         help="longueur minimale d'une coupure NULL pour --missing-blocks (défaut : 5)")
+    parser.add_argument("--max-lag", type=int, default=10,
+                        help="décalage maximal en ticks pour --lag-correlate (défaut : 10)")
     parser.add_argument("--columns", nargs="+", help="sous-ensemble de métriques (pour --outliers, --by, --stuck-runs, --collinear, --missing-blocks)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--compare", nargs=2, metavar=("BASELINE", "TARGET"),
@@ -1315,6 +1400,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                       help="lister les paires de sondes numériques redondantes (|r| >= --r-threshold)")
     mode.add_argument("--missing-blocks", action="store_true",
                       help="détecter les coupures contiguës de valeurs NULL par métrique")
+    mode.add_argument("--lag-correlate", nargs=2, metavar=("TARGET", "SOURCE"),
+                      help="corrélation croisée décalée source[t-lag] -> target[t]")
     output_fmt = parser.add_mutually_exclusive_group()
     output_fmt.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
     output_fmt.add_argument("--markdown", action="store_true",
@@ -1323,7 +1410,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.markdown and any((
         args.compare, args.correlate, args.outliers, args.check_labels,
         args.drift, args.by, args.check_bounds, args.stuck_runs, args.changepoints,
-        args.collinear, args.missing_blocks,
+        args.collinear, args.missing_blocks, args.lag_correlate,
     )):
         parser.error("--markdown s'applique uniquement au mode exploratoire par défaut")
 
@@ -1383,6 +1470,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.db, boot_id=args.boot_id, since=since, until=until,
                 min_run=args.min_missing, columns=args.columns,
             )
+        elif args.lag_correlate:
+            result = lag_correlate(
+                args.db, args.lag_correlate[0], args.lag_correlate[1],
+                boot_id=args.boot_id, since=since, until=until,
+                max_lag=args.max_lag, min_pairs=args.min_pairs,
+            )
         else:
             result = analyze_dataset(
                 args.db, boot_id=args.boot_id, since=since,
@@ -1397,6 +1490,14 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.markdown:
         print(format_markdown(result))
+        return
+
+    if args.lag_correlate:
+        best = result["best"]
+        best_txt = f"meilleur lag={best['lag']} (r={_fmt(best['r'], 3)})" if best else "aucune corrélation"
+        print(f"Corrélation décalée {result['source']}[t-lag] → {result['target']}[t] ({best_txt}) :")
+        for item in result["lags"]:
+            print(f"  lag={item['lag']:2d} : r={_fmt(item['r'], 3)}, r²={_fmt(item['r_squared'], 3)} (n={item['pairs']})")
         return
 
     if args.missing_blocks:

@@ -443,6 +443,11 @@ class BaselineDetectorTest(unittest.TestCase):
         self.assertEqual(entries[0]["label"], "review_me")
         inserted, skipped = self.storage.import_labels(entries)
         self.assertEqual((inserted, skipped), (1, 0))
+        tuned_high = tune_threshold(
+            self.db, baseline_label="normal", since=11000, eval_label="airflow_blocked",
+            direction="high", thresholds=[2.0, 4.0], min_samples=3,
+        )
+        self.assertEqual(tuned_high["best"]["threshold"], 4.0)
 
 
 if __name__ == "__main__":

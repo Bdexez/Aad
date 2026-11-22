@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 from collector import detector as detector_module
-from collector.detector import detect_anomalies
+from collector.detector import detect_anomalies, tune_threshold
 from collector.main import SCHEMA
 from collector.storage import Storage
 
@@ -204,6 +204,31 @@ class BaselineDetectorTest(unittest.TestCase):
             threshold=4.0, min_samples=3,
         )
         self.assertAlmostEqual(reloaded["evaluation"]["f1"], 1.0)
+
+    def test_tune_threshold_selects_optimal_f1_threshold(self):
+        self.seed_experiment()
+        tuned = tune_threshold(
+            self.db,
+            baseline_label="normal",
+            eval_label="airflow_blocked",
+            since=11000,
+            thresholds=[1.0, 4.0, 50.0],
+            min_samples=3,
+        )
+        self.assertEqual(tuned["best"]["threshold"], 4.0)
+        self.assertAlmostEqual(tuned["best"]["f1"], 1.0)
+
+        with redirect_stdout(io.StringIO()) as out:
+            detector_module.main([
+                "--db", str(self.db), "--baseline-label", "normal",
+                "--since", "11000", "--eval-label", "airflow_blocked",
+                "--tune-threshold", "--thresholds", "2.0", "4.0",
+            ])
+        self.assertIn("meilleur seuil", out.getvalue())
+
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exc:
+            detector_module.main(["--db", str(self.db), "--baseline-label", "normal", "--tune-threshold"])
+        self.assertEqual(exc.exception.code, 2)
 
 
 if __name__ == "__main__":

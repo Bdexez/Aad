@@ -499,6 +499,164 @@ def detect_anomalies(
     return result
 
 
+_DEFAULT_TUNE_THRESHOLDS = (2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 7.0, 8.0)
+
+
+def _evaluate_scores_at_threshold(
+    scored: Sequence[tuple[str, float | None, bool]],
+    threshold: float,
+    min_samples: int,
+) -> dict:
+    tp = fp = fn = tn = 0
+    episodes = 0
+    run_boot: str | None = None
+    run_len = 0
+    run_pos = 0
+
+    def flush() -> None:
+        nonlocal tp, fp, fn, tn, episodes, run_boot, run_len, run_pos
+        if run_len == 0:
+            return
+        if run_len >= min_samples:
+            episodes += 1
+            tp += run_pos
+            fp += run_len - run_pos
+        else:
+            fn += run_pos
+            tn += run_len - run_pos
+        run_boot = None
+        run_len = 0
+        run_pos = 0
+
+    for boot, max_abs, is_pos in scored:
+        if run_len > 0 and boot != run_boot:
+            flush()
+        if max_abs is not None and max_abs >= threshold:
+            run_boot = boot
+            run_len += 1
+            if is_pos:
+                run_pos += 1
+        else:
+            flush()
+            if is_pos:
+                fn += 1
+            else:
+                tn += 1
+    flush()
+    return {"threshold": threshold, "episodes": episodes, **_f1_metrics(tp, fp, fn, tn)}
+
+
+def tune_threshold(
+    db: str | pathlib.Path,
+    *,
+    eval_label: str,
+    baseline_label: str | None = None,
+    baseline_boot: str | None = None,
+    baseline_since: int | None = None,
+    baseline_until: int | None = None,
+    boot_id: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+    target_label: str | None = None,
+    columns: Sequence[str] | None = None,
+    control_for: str | None = None,
+    thresholds: Sequence[float] | None = None,
+    min_samples: int = 3,
+    load_model: str | pathlib.Path | None = None,
+) -> dict:
+    """Évalue une grille de seuils z en une passe et sélectionne le meilleur F1."""
+    eval_label = eval_label.strip()
+    if not eval_label:
+        raise ValueError("--eval-label ne peut pas être vide")
+    if min_samples < 1:
+        raise ValueError("--min-samples doit être >= 1")
+    grid = list(_DEFAULT_TUNE_THRESHOLDS if thresholds is None else thresholds)
+    if not grid or any(not math.isfinite(t) or t <= 0 for t in grid):
+        raise ValueError("--thresholds doit contenir des nombres finis > 0")
+    validate_time_range(baseline_since, baseline_until)
+    validate_time_range(since, until)
+
+    base_where, base_params = _scoped_where(
+        boot_id=baseline_boot, since=baseline_since, until=baseline_until, label=baseline_label,
+    )
+    target_where, target_params = _scoped_where(
+        boot_id=boot_id, since=since, until=until, label=target_label,
+    )
+
+    with read_snapshot(db) as conn:
+        metrics, order_col = _numeric_metrics(conn)
+        numeric_names = [name for name, _ in metrics]
+        if columns is not None:
+            selected = list(columns)
+            if not selected or (set(selected) - set(numeric_names)):
+                raise ValueError("colonnes sélectionnées invalides")
+        else:
+            selected = numeric_names
+
+        if load_model is not None:
+            loaded_meta, loaded_features = load_baseline_model(load_model)
+            control_for = loaded_meta.get("control_for")
+            if control_for is not None and control_for not in numeric_names:
+                raise ValueError(f"colonne de contrôle du modèle absente: {control_for!r}")
+            selected_set = set(selected)
+            fitted = [fb for fb in loaded_features if fb.column in selected_set]
+            if not fitted:
+                raise ValueError("aucune métrique du modèle n'est présente dans la base cible")
+        else:
+            if control_for is not None and control_for not in numeric_names:
+                raise ValueError(f"colonne de contrôle introuvable: {control_for!r}")
+            _, fitted, _ = _fit_baseline(conn, selected, base_where, base_params, control_for=control_for)
+
+        projection = ", ".join(f"s.{quote_identifier(fb.column)}" for fb in fitted)
+        control_select = f", s.{quote_identifier(control_for)}" if control_for is not None else ""
+        clause, e_params = _label_exists_clause(eval_label)
+        cursor = conn.execute(
+            f"SELECT s.boot_id, {projection}{control_select}, ({clause})"
+            f" FROM samples AS s{target_where}"
+            f" ORDER BY s.boot_id, s.{quote_identifier(order_col)}",
+            [*e_params, *target_params],
+        )
+        n_feat = len(fitted)
+        has_control = control_for is not None
+        scored: list[tuple[str, float | None, bool]] = []
+        for row in cursor:
+            boot = row[0]
+            values = row[1 : 1 + n_feat]
+            ctrl_val = row[1 + n_feat] if has_control else None
+            is_pos = bool(row[1 + n_feat + (1 if has_control else 0)])
+            max_abs: float | None = None
+            for fb, val in zip(fitted, values):
+                if val is None:
+                    continue
+                if fb.intercept is not None:
+                    if ctrl_val is None:
+                        continue
+                    expected = fb.intercept + fb.slope * ctrl_val + fb.center
+                else:
+                    expected = fb.center
+                az = abs((val - expected) / fb.scale)
+                if max_abs is None or az > max_abs:
+                    max_abs = az
+            scored.append((boot, max_abs, is_pos))
+
+    results = [_evaluate_scores_at_threshold(scored, t, min_samples) for t in sorted(set(grid))]
+    best = max(
+        results,
+        key=lambda r: (
+            r["f1"] if r["f1"] is not None else -1.0,
+            r["precision"] if r["precision"] is not None else -1.0,
+            r["threshold"],
+        ),
+    )
+    return {
+        "eval_label": eval_label,
+        "samples": len(scored),
+        "min_samples": min_samples,
+        "best": best,
+        "grid": results,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Détecteur statistique d'anomalies AAD (z-score robuste / MAD)"
@@ -523,6 +681,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="marge (ms) pour associer les événements autour d'un épisode (défaut : 5000)")
     parser.add_argument("--save-model", type=pathlib.Path, help="sauvegarder le modèle ajusté en JSON")
     parser.add_argument("--load-model", type=pathlib.Path, help="charger un modèle JSON existant")
+    parser.add_argument("--tune-threshold", action="store_true",
+                        help="calibrer le seuil optimal (F1) sur --eval-label")
+    parser.add_argument("--thresholds", nargs="+", type=float,
+                        help="grille de seuils personnalisée pour --tune-threshold")
     parser.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
     args = parser.parse_args(argv)
 
@@ -533,32 +695,68 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--load-model ne se combine pas avec les options --baseline-*")
     if args.load_model is None and not has_baseline_opts:
         parser.error("spécifiez une référence (--baseline-label, --baseline-boot, --baseline-since/--baseline-until ou --load-model)")
+    if args.tune_threshold and not args.eval_label:
+        parser.error("--tune-threshold nécessite --eval-label")
 
     try:
-        result = detect_anomalies(
-            args.db,
-            baseline_label=args.baseline_label,
-            baseline_boot=args.baseline_boot,
-            baseline_since=args.baseline_since,
-            baseline_until=args.baseline_until,
-            boot_id=args.boot_id,
-            since=args.since,
-            until=args.until,
-            target_label=args.target_label,
-            eval_label=args.eval_label,
-            columns=args.columns,
-            control_for=args.control_for,
-            threshold=args.threshold,
-            min_samples=args.min_samples,
-            event_margin_ms=args.event_margin_ms,
-            load_model=args.load_model,
-            save_model=args.save_model,
-        )
+        if args.tune_threshold:
+            result = tune_threshold(
+                args.db,
+                eval_label=args.eval_label,
+                baseline_label=args.baseline_label,
+                baseline_boot=args.baseline_boot,
+                baseline_since=args.baseline_since,
+                baseline_until=args.baseline_until,
+                boot_id=args.boot_id,
+                since=args.since,
+                until=args.until,
+                target_label=args.target_label,
+                columns=args.columns,
+                control_for=args.control_for,
+                thresholds=args.thresholds,
+                min_samples=args.min_samples,
+                load_model=args.load_model,
+            )
+        else:
+            result = detect_anomalies(
+                args.db,
+                baseline_label=args.baseline_label,
+                baseline_boot=args.baseline_boot,
+                baseline_since=args.baseline_since,
+                baseline_until=args.baseline_until,
+                boot_id=args.boot_id,
+                since=args.since,
+                until=args.until,
+                target_label=args.target_label,
+                eval_label=args.eval_label,
+                columns=args.columns,
+                control_for=args.control_for,
+                threshold=args.threshold,
+                min_samples=args.min_samples,
+                event_margin_ms=args.event_margin_ms,
+                load_model=args.load_model,
+                save_model=args.save_model,
+            )
     except (ValueError, OSError, sqlite3.Error) as exc:
         parser.error(str(exc))
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.tune_threshold:
+        fmt = lambda v: "n/a" if v is None else f"{v:.3f}"
+        best = result["best"]
+        print(
+            f"Calibration ({result['eval_label']}, {result['samples']} mesures) — "
+            f"meilleur seuil : z >= {best['threshold']} (f1={fmt(best['f1'])}, "
+            f"precision={fmt(best['precision'])}, recall={fmt(best['recall'])})"
+        )
+        for row in result["grid"]:
+            print(
+                f"  z >= {row['threshold']:4.1f} : episodes={row['episodes']}, "
+                f"precision={fmt(row['precision'])}, recall={fmt(row['recall'])}, f1={fmt(row['f1'])}"
+            )
         return
 
     base = result["baseline"]

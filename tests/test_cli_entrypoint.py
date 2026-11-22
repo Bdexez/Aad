@@ -57,6 +57,14 @@ class UnifiedCliEntryPointTest(unittest.TestCase):
         self.assertEqual(exc.exception.code, 2)
         self.assertIn("commande inconnue", err.getvalue())
 
+    def test_every_registered_subcommand_supports_help(self):
+        for cmd in cli_entry.COMMANDS:
+            with self.subTest(command=cmd), redirect_stdout(io.StringIO()) as out:
+                with self.assertRaises(SystemExit) as exc:
+                    cli_entry.main([cmd, "--help"])
+                self.assertEqual(exc.exception.code, 0)
+                self.assertIn("usage:", out.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

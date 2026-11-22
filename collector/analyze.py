@@ -1634,6 +1634,134 @@ def analyze_core_skew(
     }
 
 
+def detect_event_bursts(
+    db: str | pathlib.Path,
+    *,
+    since: int | None = None,
+    until: int | None = None,
+    gap_ms: int = 10_000,
+    min_events: int = 2,
+    include_collector: bool = False,
+) -> dict:
+    """Regroupe les événements rapprochés (<= gap_ms) en rafales d'incidents."""
+    if gap_ms < 0:
+        raise ValueError("--burst-gap-ms doit être >= 0")
+    if min_events < 2:
+        raise ValueError("--burst-min doit être >= 2")
+    validate_time_range(since, until)
+    filters = []
+    params: list[int | str] = []
+    if since is not None:
+        filters.append("ts >= ?")
+        params.append(since)
+    if until is not None:
+        filters.append("ts < ?")
+        params.append(until)
+    if not include_collector:
+        filters.append("NOT (source = 'collector' AND kind IN ('start', 'stop'))")
+    where = " WHERE " + " AND ".join(filters) if filters else ""
+    with read_snapshot(db) as conn:
+        rows = conn.execute(
+            f"SELECT ts, source, kind, severity FROM events{where} ORDER BY ts, id",
+            params,
+        ).fetchall()
+
+    bursts: list[dict] = []
+    cur: list[tuple] = []
+
+    def flush() -> None:
+        if len(cur) >= min_events:
+            kinds: dict[str, int] = {}
+            sevs: dict[str, int] = {}
+            for _, _, k, s in cur:
+                kinds[k] = kinds.get(k, 0) + 1
+                sev = s or "unknown"
+                sevs[sev] = sevs.get(sev, 0) + 1
+            bursts.append({
+                "ts_start": cur[0][0],
+                "ts_end": cur[-1][0],
+                "duration_ms": cur[-1][0] - cur[0][0],
+                "count": len(cur),
+                "kinds": kinds,
+                "severities": sevs,
+            })
+
+    for row in rows:
+        if cur and (row[0] - cur[-1][0]) > gap_ms:
+            flush()
+            cur = []
+        cur.append(row)
+    flush()
+    bursts.sort(key=lambda b: (-b["count"], b["ts_start"]))
+    return {
+        "window": {"since": since, "until": until},
+        "gap_ms": gap_ms,
+        "min_events": min_events,
+        "bursts": bursts,
+    }
+
+
+def describe_schema(
+    db: str | pathlib.Path,
+    *,
+    boot_id: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+) -> dict:
+    """Produit un dictionnaire de données complet pour toutes les colonnes de `samples`."""
+    validate_time_range(since, until)
+    where, params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
+    with read_snapshot(db) as conn:
+        fields = conn.execute("PRAGMA table_info(samples)").fetchall()
+        total = conn.execute("SELECT COUNT(*) FROM samples AS s" + where, params).fetchone()[0]
+        numeric_cols = [
+            (f[1], f[2]) for f in fields
+            if f[1] not in _META_COLUMNS and (f[2] or "").upper() != "TEXT"
+        ]
+        num_stats = {m["column"]: m for m in _compute_numeric_stats(conn, numeric_cols, total, where, params)}
+        text_cols = [f[1] for f in fields if f[1] not in _META_COLUMNS and (f[2] or "").upper() == "TEXT"]
+        text_counts: dict[str, int] = {}
+        if text_cols:
+            row = conn.execute(
+                "SELECT " + ", ".join(f"COUNT({quote_identifier(c)})" for c in text_cols)
+                + " FROM samples AS s" + where,
+                params,
+            ).fetchone()
+            text_counts = dict(zip(text_cols, row))
+
+        columns_info = []
+        for _, name, coltype, *_ in fields:
+            if name in _META_COLUMNS:
+                columns_info.append({
+                    "column": name, "type": coltype, "role": "meta",
+                    "unit": "epoch ms" if name == "ts" else None,
+                    "present": total, "coverage_pct": _percentage(total, total), "is_constant": None,
+                })
+            elif name in num_stats:
+                st = num_stats[name]
+                bounds = _physical_bounds_for(name)
+                columns_info.append({
+                    "column": name, "type": coltype, "role": "numeric",
+                    "unit": bounds[2] if bounds else None,
+                    "present": st["present"], "coverage_pct": st["coverage_pct"],
+                    "is_constant": st["is_constant"],
+                })
+            else:
+                present = text_counts.get(name, 0)
+                columns_info.append({
+                    "column": name, "type": coltype, "role": "text",
+                    "unit": None,
+                    "present": present, "coverage_pct": _percentage(present, total),
+                    "is_constant": None,
+                })
+    return {
+        "boot_id": boot_id,
+        "window": {"since": since, "until": until},
+        "samples": total,
+        "columns": columns_info,
+    }
+
+
 def format_markdown(report: dict) -> str:
     """Formate le rapport exploratoire `analyze_dataset()` en tableaux Markdown (GFM)."""
     lines = [f"# Analyse du dataset AAD ({report['samples']} mesures)", ""]
@@ -1701,6 +1829,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="demi-fenêtre avant/après en ms pour --event-impact (défaut : 30000)")
     parser.add_argument("--skew-threshold", type=float, default=0.5,
                         help="écart max-min d'utilisation inter-cœurs pour --core-skew (défaut : 0.5)")
+    parser.add_argument("--burst-gap-ms", type=int, default=10_000,
+                        help="écart max (ms) entre deux événements d'une même rafale (défaut : 10000)")
+    parser.add_argument("--burst-min", type=int, default=2,
+                        help="nombre minimal d'événements pour former une rafale (défaut : 2)")
     parser.add_argument("--columns", nargs="+", help="sous-ensemble de métriques (pour --outliers, --by, --stuck-runs, --collinear, --missing-blocks, --clipping)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--compare", nargs=2, metavar=("BASELINE", "TARGET"),
@@ -1737,6 +1869,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                       help="comparer les métriques avant vs après les événements d'un genre donné")
     mode.add_argument("--core-skew", action="store_true",
                       help="mesurer l'asymétrie d'utilisation entre cœurs CPU (cpu0_util..cpuN_util)")
+    mode.add_argument("--event-bursts", action="store_true",
+                      help="regrouper les événements rapprochés en rafales d'incidents")
+    mode.add_argument("--describe-schema", action="store_true",
+                      help="produire le dictionnaire de données (types, unités, complétude)")
     output_fmt = parser.add_mutually_exclusive_group()
     output_fmt.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
     output_fmt.add_argument("--markdown", action="store_true",
@@ -1747,6 +1883,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.drift, args.by, args.check_bounds, args.stuck_runs, args.changepoints,
         args.collinear, args.missing_blocks, args.lag_correlate, args.clipping,
         args.thermal_profile, args.compare_boots, args.event_impact, args.core_skew,
+        args.event_bursts, args.describe_schema,
     )):
         parser.error("--markdown s'applique uniquement au mode exploratoire par défaut")
 
@@ -1838,6 +1975,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.db, boot_id=boot_id, since=since, until=until,
                 skew_threshold=args.skew_threshold,
             )
+        elif args.event_bursts:
+            result = detect_event_bursts(
+                args.db, since=since, until=until,
+                gap_ms=args.burst_gap_ms, min_events=args.burst_min,
+            )
+        elif args.describe_schema:
+            result = describe_schema(
+                args.db, boot_id=boot_id, since=since, until=until,
+            )
         else:
             result = analyze_dataset(
                 args.db, boot_id=boot_id, since=since,
@@ -1852,6 +1998,20 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.markdown:
         print(format_markdown(result))
+        return
+
+    if args.event_bursts:
+        print(f"Rafales d'événements (>= {result['min_events']} événements, écart <= {result['gap_ms']} ms) :")
+        for b in result["bursts"]:
+            kinds = ", ".join(f"{k}×{v}" for k, v in sorted(b["kinds"].items()))
+            print(f"  [{b['ts_start']}..{b['ts_end']}] n={b['count']} ({b['duration_ms']} ms) — {kinds}")
+        return
+
+    if args.describe_schema:
+        print(f"Dictionnaire de données ({len(result['columns'])} colonnes, {result['samples']} mesures) :")
+        for c in result["columns"]:
+            unit = f" [{c['unit']}]" if c["unit"] else ""
+            print(f"  {c['column']:24} {c['type']:8} ({c['role']}){unit} — {_fmt(c['coverage_pct'], 1)} %")
         return
 
     if args.core_skew:

@@ -16,16 +16,23 @@ from collector.analyze import (
     check_physical_bounds,
     compare_labels,
     correlate_metric,
+    detect_clipping,
+    detect_collinearity,
+    detect_missing_blocks,
     detect_outliers,
+    detect_stuck_runs,
 )
 from collector.backup import backup_database, verify_database
 from collector.detector import detect_anomalies, tune_threshold
 from collector.export import export_csv, export_downsampled, export_events, export_jsonl
 from collector.features import export_features
-from collector.html_report import write_html_report
+from collector.html_report import render_html_report, write_html_report
 from collector.main import SCHEMA
+from collector.merge import merge_databases
 from collector.report import dataset_report
+from collector.retention import prune_database
 from collector.storage import Storage
+from collector.summary import campaign_summary
 
 
 class EndToEndPipelineTest(unittest.TestCase):
@@ -139,6 +146,36 @@ class EndToEndPipelineTest(unittest.TestCase):
             html_text = html_path.read_text(encoding="utf-8")
             self.assertIn("Épisodes anormaux détectés (1)", html_text)
             self.assertIn("<polyline", html_text)
+
+    def test_all_tools_handle_empty_database_gracefully(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            db1 = root / "empty1.db"
+            db2 = root / "empty2.db"
+            for path in (db1, db2):
+                with Storage(path, SCHEMA) as s:
+                    s.ensure_columns(["cpu_util", "k10temp_tctl"])
+
+            self.assertTrue(verify_database(db1)["ok"])
+            self.assertTrue(campaign_summary(db1)["healthy"])
+            self.assertEqual(dataset_report(db1)["samples"]["count"], 0)
+            self.assertEqual(analyze_dataset(db1)["samples"], 0)
+            self.assertEqual(audit_labels(db1)["total_windows"], 0)
+            self.assertEqual(check_physical_bounds(db1)["total_violations"], 0)
+            self.assertEqual(detect_outliers(db1)["metrics"][0]["present"], 0)
+            self.assertEqual(detect_stuck_runs(db1)["stuck_metrics"], [])
+            self.assertEqual(detect_missing_blocks(db1)["missing_blocks"], [])
+            self.assertEqual(detect_clipping(db1)["clipped_metrics"], [])
+            self.assertEqual(detect_collinearity(db1)["collinear_pairs"], [])
+            self.assertEqual(analyze_drift(db1)["metrics"], [])
+            self.assertIn("<!DOCTYPE html>", render_html_report(db1))
+            self.assertEqual(export_csv(db1, io.StringIO()), 0)
+            self.assertEqual(export_jsonl(db1, io.StringIO()), 0)
+            self.assertEqual(export_downsampled(db1, io.StringIO(), bucket_ms=1000), 0)
+            self.assertEqual(export_events(db1, io.StringIO()), 0)
+            self.assertEqual(export_features(db1, io.StringIO(), deltas=True, rolling=3), 0)
+            self.assertEqual(prune_database(db1, before_ts=1000, dry_run=True)["samples"], 0)
+            self.assertEqual(merge_databases([db1, db2], root / "merged.db")["samples"], 0)
 
 
 if __name__ == "__main__":

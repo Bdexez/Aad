@@ -383,6 +383,15 @@ class BaselineDetectorTest(unittest.TestCase):
         self.assertFalse(incompat["compatible"])
         self.assertEqual(set(incompat["missing_features"]), {"temp_c", "fan_rpm"})
 
+        with redirect_stdout(io.StringIO()) as out:
+            detector_module.main(["--load-model", str(model_path), "--inspect-model"])
+        self.assertIn("temp_c : center=", out.getvalue())
+
+        res_excl = detect_anomalies(
+            self.db, baseline_label="normal", since=11000, exclude_columns=["fan_rpm"],
+        )
+        self.assertEqual(res_excl["baseline"]["features_used"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -291,6 +291,7 @@ def detect_anomalies(
     target_label: str | None = None,
     eval_label: str | None = None,
     columns: Sequence[str] | None = None,
+    exclude_columns: Sequence[str] | None = None,
     control_for: str | None = None,
     group_by: str | None = None,
     score_mode: str = "max",
@@ -303,6 +304,8 @@ def detect_anomalies(
     export_scores: str | pathlib.Path | None = None,
 ) -> dict:
     """Ajuste ou charge une référence robuste et détecte les épisodes anormaux."""
+    if columns is not None and exclude_columns is not None:
+        raise ValueError("--columns et --exclude-columns sont mutuellement exclusifs")
     if score_mode not in ("max", "rms"):
         raise ValueError("--score-mode doit valoir 'max' ou 'rms'")
     if not math.isfinite(threshold) or threshold <= 0:
@@ -349,7 +352,10 @@ def detect_anomalies(
             if unknown:
                 raise ValueError(f"métriques numériques introuvables: {', '.join(sorted(unknown))}")
         else:
-            selected = numeric_names
+            excluded = set(exclude_columns or ())
+            selected = [c for c in numeric_names if c not in excluded]
+            if not selected and excluded:
+                raise ValueError("toutes les colonnes numériques ont été exclues")
 
         grouped_fitted: dict[str, dict[str, FeatureBaseline]] = {}
         if load_model is not None:
@@ -1023,6 +1029,19 @@ def check_model_compatibility(
     }
 
 
+def inspect_model(model_path: str | pathlib.Path) -> dict:
+    """Retourne les paramètres lisibles d'un modèle JSON sauvegardé."""
+    meta, features, grouped = load_baseline_model(model_path)
+    return {
+        "model": str(model_path),
+        "baseline": meta,
+        "features": [_serialize_feature(f) for f in features],
+        "grouped_features": {
+            k: [_serialize_feature(f) for f in v] for k, v in grouped.items()
+        },
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Détecteur statistique d'anomalies AAD (z-score robuste / MAD)"
@@ -1039,6 +1058,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--target-label", help="limiter la cible à un label")
     parser.add_argument("--eval-label", help="évaluer précision/rappel/F1 face à un label terrain")
     parser.add_argument("--columns", nargs="+", help="sous-ensemble de métriques numériques")
+    parser.add_argument("--exclude-columns", nargs="+", help="métriques numériques à exclure du scoring")
     parser.add_argument("--control-for", help="métrique de charge/contexte utilisée pour le scoring par résidus")
     parser.add_argument("--group-by", help="colonne de régime discret (ex. is_gaming) pour ajuster un profil par régime")
     parser.add_argument("--score-mode", choices=("max", "rms"), default="max",
@@ -1059,6 +1079,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="comparer plusieurs stratégies (raw/control-for/group-by × max/rms) sur --eval-label")
     parser.add_argument("--check-model", action="store_true",
                         help="vérifier la compatibilité de --load-model avec la base cible")
+    parser.add_argument("--inspect-model", action="store_true",
+                        help="afficher les paramètres appris de --load-model sans ouvrir de base")
     parser.add_argument("--thresholds", nargs="+", type=float,
                         help="grille de seuils personnalisée pour --tune-threshold")
     parser.add_argument("--output", default="-",
@@ -1073,8 +1095,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--load-model ne se combine pas avec les options --baseline-*")
     if args.load_model is None and not has_baseline_opts:
         parser.error("spécifiez une référence (--baseline-label, --baseline-boot, --baseline-since/--baseline-until ou --load-model)")
-    if args.check_model and args.load_model is None:
-        parser.error("--check-model nécessite --load-model")
+    if (args.check_model or args.inspect_model) and args.load_model is None:
+        parser.error("--check-model et --inspect-model nécessitent --load-model")
     if args.tune_threshold and args.benchmark:
         parser.error("--tune-threshold et --benchmark sont mutuellement exclusifs")
     if (args.tune_threshold or args.benchmark) and not args.eval_label:
@@ -1084,7 +1106,9 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     try:
         since, until = resolve_last_minutes(args.last_minutes, args.since, args.until)
-        if args.check_model:
+        if args.inspect_model:
+            result = inspect_model(args.load_model)
+        elif args.check_model:
             result = check_model_compatibility(
                 args.db, args.load_model, boot_id=args.boot_id, since=since, until=until,
             )
@@ -1139,6 +1163,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 target_label=args.target_label,
                 eval_label=args.eval_label,
                 columns=args.columns,
+                exclude_columns=args.exclude_columns,
                 control_for=args.control_for,
                 group_by=args.group_by,
                 score_mode=args.score_mode,
@@ -1155,6 +1180,22 @@ def main(argv: Sequence[str] | None = None) -> None:
     def emit_output(stream) -> None:
         if args.json:
             stream.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+            return
+
+        if args.inspect_model:
+            base = result["baseline"]
+            print(f"Modèle {result['model']} ({len(result['features'])} métriques) :", file=stream)
+            if base.get("control_for"):
+                print(f"  control_for : {base['control_for']}", file=stream)
+            if base.get("group_by"):
+                print(f"  group_by    : {base['group_by']} ({len(result['grouped_features'])} régime(s))", file=stream)
+            for f in result["features"]:
+                reg = f", slope={f['slope']:.3f}, intercept={f['intercept']:.2f}" if f["intercept"] is not None else ""
+                print(
+                    f"  {f['column']} : center={f['center']:.2f}, scale={f['scale']:.2f} "
+                    f"[{f['method']}, n={f['present']}{reg}]",
+                    file=stream,
+                )
             return
 
         if args.check_model:

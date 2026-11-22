@@ -32,29 +32,61 @@ class FeatureBaseline:
     slope: float = 0.0
 
 
+def _serialize_feature(f: FeatureBaseline) -> dict:
+    return {
+        "column": f.column,
+        "center": f.center,
+        "scale": f.scale,
+        "method": f.method,
+        "present": f.present,
+        "intercept": f.intercept,
+        "slope": f.slope,
+    }
+
+
+def _deserialize_feature(item: object) -> FeatureBaseline:
+    if not isinstance(item, dict):
+        raise ValueError("entrée de métrique invalide dans le modèle")
+    col = item.get("column")
+    center = item.get("center")
+    scale = item.get("scale")
+    method = item.get("method")
+    present = item.get("present", 0)
+    intercept = item.get("intercept")
+    slope = item.get("slope", 0.0)
+    if (
+        not isinstance(col, str)
+        or not isinstance(center, (int, float)) or not math.isfinite(center)
+        or not isinstance(scale, (int, float)) or not math.isfinite(scale) or scale <= 0
+        or method not in ("mad", "std")
+        or not isinstance(present, int) or present < 0
+        or (intercept is not None and (not isinstance(intercept, (int, float)) or not math.isfinite(intercept)))
+        or not isinstance(slope, (int, float)) or not math.isfinite(slope)
+    ):
+        raise ValueError(f"paramètres invalides pour la métrique {col!r}")
+    return FeatureBaseline(
+        col, float(center), float(scale), method, present,
+        None if intercept is None else float(intercept), float(slope),
+    )
+
+
 def save_baseline_model(
     path: str | pathlib.Path,
     baseline_meta: dict,
     features: Sequence[FeatureBaseline],
+    grouped_features: dict[str, list[FeatureBaseline]] | None = None,
 ) -> pathlib.Path:
     """Enregistre un modèle de référence en JSON (refuse d'écraser un fichier existant)."""
     target = pathlib.Path(path)
-    payload = {
+    payload: dict = {
         "version": 1,
         "baseline": baseline_meta,
-        "features": [
-            {
-                "column": f.column,
-                "center": f.center,
-                "scale": f.scale,
-                "method": f.method,
-                "present": f.present,
-                "intercept": f.intercept,
-                "slope": f.slope,
-            }
-            for f in features
-        ],
+        "features": [_serialize_feature(f) for f in features],
     }
+    if grouped_features:
+        payload["grouped_features"] = {
+            k: [_serialize_feature(f) for f in v] for k, v in grouped_features.items()
+        }
     stream = target.open("x", encoding="utf-8")
     try:
         with stream:
@@ -66,7 +98,9 @@ def save_baseline_model(
     return target
 
 
-def load_baseline_model(path: str | pathlib.Path) -> tuple[dict, list[FeatureBaseline]]:
+def load_baseline_model(
+    path: str | pathlib.Path,
+) -> tuple[dict, list[FeatureBaseline], dict[str, list[FeatureBaseline]]]:
     """Charge et valide un modèle de référence JSON."""
     raw = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
     if not isinstance(raw, dict) or raw.get("version") != 1:
@@ -74,35 +108,16 @@ def load_baseline_model(path: str | pathlib.Path) -> tuple[dict, list[FeatureBas
     items = raw.get("features")
     if not isinstance(items, list) or not items:
         raise ValueError("le modèle ne contient aucune métrique")
-    features: list[FeatureBaseline] = []
-    for item in items:
-        if not isinstance(item, dict):
-            raise ValueError("entrée de métrique invalide dans le modèle")
-        col = item.get("column")
-        center = item.get("center")
-        scale = item.get("scale")
-        method = item.get("method")
-        present = item.get("present", 0)
-        intercept = item.get("intercept")
-        slope = item.get("slope", 0.0)
-        if (
-            not isinstance(col, str)
-            or not isinstance(center, (int, float)) or not math.isfinite(center)
-            or not isinstance(scale, (int, float)) or not math.isfinite(scale) or scale <= 0
-            or method not in ("mad", "std")
-            or not isinstance(present, int) or present < 0
-            or (intercept is not None and (not isinstance(intercept, (int, float)) or not math.isfinite(intercept)))
-            or not isinstance(slope, (int, float)) or not math.isfinite(slope)
-        ):
-            raise ValueError(f"paramètres invalides pour la métrique {col!r}")
-        features.append(
-            FeatureBaseline(
-                col, float(center), float(scale), method, present,
-                None if intercept is None else float(intercept), float(slope),
-            )
-        )
+    features = [_deserialize_feature(item) for item in items]
+    grouped: dict[str, list[FeatureBaseline]] = {}
+    raw_grouped = raw.get("grouped_features")
+    if isinstance(raw_grouped, dict):
+        for k, v in raw_grouped.items():
+            if not isinstance(k, str) or not isinstance(v, list):
+                raise ValueError("grouped_features invalide dans le modèle")
+            grouped[k] = [_deserialize_feature(item) for item in v]
     meta = raw.get("baseline") if isinstance(raw.get("baseline"), dict) else {}
-    return meta, features
+    return meta, features, grouped
 
 
 def _label_exists_clause(label: str) -> tuple[str, list[str]]:
@@ -234,6 +249,7 @@ def detect_anomalies(
     eval_label: str | None = None,
     columns: Sequence[str] | None = None,
     control_for: str | None = None,
+    group_by: str | None = None,
     threshold: float = 4.0,
     min_samples: int = 3,
     top_contributors: int = 3,
@@ -277,6 +293,7 @@ def detect_anomalies(
     with read_snapshot(db) as conn:
         metrics, order_col = _numeric_metrics(conn)
         numeric_names = [name for name, _ in metrics]
+        all_cols = {f[1] for f in conn.execute("PRAGMA table_info(samples)").fetchall()}
         if columns is not None:
             selected = list(columns)
             if not selected:
@@ -287,16 +304,22 @@ def detect_anomalies(
         else:
             selected = numeric_names
 
+        grouped_fitted: dict[str, dict[str, FeatureBaseline]] = {}
         if load_model is not None:
-            loaded_meta, loaded_features = load_baseline_model(load_model)
+            loaded_meta, loaded_features, loaded_grouped = load_baseline_model(load_model)
             control_for = loaded_meta.get("control_for")
+            group_by = loaded_meta.get("group_by")
             if control_for is not None and control_for not in numeric_names:
                 raise ValueError(f"colonne de contrôle du modèle absente: {control_for!r}")
+            if group_by is not None and group_by not in all_cols:
+                raise ValueError(f"colonne de régime du modèle absente: {group_by!r}")
             selected_set = set(selected)
             fitted = [fb for fb in loaded_features if fb.column in selected_set]
             skipped = [fb.column for fb in loaded_features if fb.column not in selected_set]
             if not fitted:
                 raise ValueError("aucune métrique du modèle n'est présente dans la base cible")
+            for g_key, g_feats in loaded_grouped.items():
+                grouped_fitted[g_key] = {fb.column: fb for fb in g_feats if fb.column in selected_set}
             baseline_meta = {
                 **loaded_meta,
                 "loaded_from": str(load_model),
@@ -306,23 +329,49 @@ def detect_anomalies(
         else:
             if control_for is not None and control_for not in numeric_names:
                 raise ValueError(f"colonne de contrôle introuvable: {control_for!r}")
+            if group_by is not None and group_by not in all_cols:
+                raise ValueError(f"colonne de régime introuvable: {group_by!r}")
+            fit_cols = [c for c in selected if c != group_by]
             baseline_count, fitted, skipped = _fit_baseline(
-                conn, selected, base_where, base_params, control_for=control_for,
+                conn, fit_cols, base_where, base_params, control_for=control_for,
             )
+            grouped_lists: dict[str, list[FeatureBaseline]] = {}
+            if group_by is not None:
+                qg = quote_identifier(group_by)
+                g_prefix = (base_where + " AND ") if base_where else " WHERE "
+                g_vals = [
+                    r[0]
+                    for r in conn.execute(
+                        f"SELECT DISTINCT s.{qg} FROM samples AS s{g_prefix}s.{qg} IS NOT NULL",
+                        base_params,
+                    )
+                ]
+                for g_val in g_vals:
+                    gw = f"{g_prefix}s.{qg} = ?"
+                    gp = [*base_params, g_val]
+                    try:
+                        _, gf, _ = _fit_baseline(conn, fit_cols, gw, gp, control_for=control_for)
+                    except ValueError:
+                        continue
+                    grouped_lists[str(g_val)] = gf
+                    grouped_fitted[str(g_val)] = {fb.column: fb for fb in gf}
             baseline_meta = {
                 "label": baseline_label,
                 "boot_id": baseline_boot,
                 "window": {"since": baseline_since, "until": baseline_until},
                 "control_for": control_for,
+                "group_by": group_by,
+                "groups_fitted": sorted(grouped_fitted),
                 "samples": baseline_count,
                 "features_used": len(fitted),
                 "features_skipped": skipped,
             }
             if save_model is not None:
-                save_baseline_model(save_model, baseline_meta, fitted)
+                save_baseline_model(save_model, baseline_meta, fitted, grouped_lists or None)
 
         projection = ", ".join(f"s.{quote_identifier(fb.column)}" for fb in fitted)
         control_select = f", s.{quote_identifier(control_for)}" if control_for is not None else ""
+        group_select = f", s.{quote_identifier(group_by)}" if group_by is not None else ""
         eval_select = ""
         query_params: list[str | int] = []
         if eval_label is not None:
@@ -332,7 +381,7 @@ def detect_anomalies(
         query_params.extend(target_params)
 
         cursor = conn.execute(
-            f"SELECT s.boot_id, s.ts, {projection}{control_select}{eval_select}"
+            f"SELECT s.boot_id, s.ts, {projection}{control_select}{group_select}{eval_select}"
             f" FROM samples AS s{target_where}"
             f" ORDER BY s.boot_id, s.{quote_identifier(order_col)}",
             query_params,
@@ -400,25 +449,33 @@ def detect_anomalies(
 
         n_feat = len(fitted)
         has_control = control_for is not None
+        has_group = group_by is not None
         for row in cursor:
             boot = row[0]
             ts = row[1]
             values = row[2 : 2 + n_feat]
-            ctrl_val = row[2 + n_feat] if has_control else None
-            eval_idx = 2 + n_feat + (1 if has_control else 0)
-            is_pos = bool(row[eval_idx]) if eval_label is not None else False
+            idx = 2 + n_feat
+            ctrl_val = row[idx] if has_control else None
+            if has_control:
+                idx += 1
+            grp_val = row[idx] if has_group else None
+            if has_group:
+                idx += 1
+            is_pos = bool(row[idx]) if eval_label is not None else False
             total_scored += 1
 
             if run_len > 0 and boot != run_boot:
                 flush_run()
 
+            active_group = grouped_fitted.get(str(grp_val)) if (has_group and grp_val is not None) else None
             max_abs = 0.0
             sq_sum = 0.0
             n_obs = 0
             z_obs: list[tuple[FeatureBaseline, float, float, float]] = []
-            for fb, val in zip(fitted, values):
+            for base_fb, val in zip(fitted, values):
                 if val is None:
                     continue
+                fb = active_group.get(base_fb.column, base_fb) if active_group is not None else base_fb
                 if fb.intercept is not None:
                     if ctrl_val is None:
                         continue
@@ -594,7 +651,7 @@ def tune_threshold(
             selected = numeric_names
 
         if load_model is not None:
-            loaded_meta, loaded_features = load_baseline_model(load_model)
+            loaded_meta, loaded_features, _ = load_baseline_model(load_model)
             control_for = loaded_meta.get("control_for")
             if control_for is not None and control_for not in numeric_names:
                 raise ValueError(f"colonne de contrôle du modèle absente: {control_for!r}")
@@ -673,6 +730,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--eval-label", help="évaluer précision/rappel/F1 face à un label terrain")
     parser.add_argument("--columns", nargs="+", help="sous-ensemble de métriques numériques")
     parser.add_argument("--control-for", help="métrique de charge/contexte utilisée pour le scoring par résidus")
+    parser.add_argument("--group-by", help="colonne de régime discret (ex. is_gaming) pour ajuster un profil par régime")
     parser.add_argument("--threshold", type=float, default=4.0,
                         help="seuil de z-score absolu (défaut : 4.0)")
     parser.add_argument("--min-samples", type=int, default=3,
@@ -731,6 +789,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 eval_label=args.eval_label,
                 columns=args.columns,
                 control_for=args.control_for,
+                group_by=args.group_by,
                 threshold=args.threshold,
                 min_samples=args.min_samples,
                 event_margin_ms=args.event_margin_ms,

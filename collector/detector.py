@@ -251,6 +251,7 @@ def detect_anomalies(
     columns: Sequence[str] | None = None,
     control_for: str | None = None,
     group_by: str | None = None,
+    score_mode: str = "max",
     threshold: float = 4.0,
     min_samples: int = 3,
     top_contributors: int = 3,
@@ -259,6 +260,8 @@ def detect_anomalies(
     save_model: str | pathlib.Path | None = None,
 ) -> dict:
     """Ajuste ou charge une référence robuste et détecte les épisodes anormaux."""
+    if score_mode not in ("max", "rms"):
+        raise ValueError("--score-mode doit valoir 'max' ou 'rms'")
     if not math.isfinite(threshold) or threshold <= 0:
         raise ValueError("--threshold doit être un nombre fini > 0")
     if min_samples < 1:
@@ -491,15 +494,21 @@ def detect_anomalies(
                 n_obs += 1
                 z_obs.append((fb, z, val, expected))
 
-            if n_obs > 0 and max_abs >= threshold:
+            if n_obs > 0:
                 rms_z = math.sqrt(sq_sum / n_obs)
+                sample_score = rms_z if score_mode == "rms" else max_abs
+            else:
+                rms_z = 0.0
+                sample_score = 0.0
+
+            if n_obs > 0 and sample_score >= threshold:
                 if run_len == 0:
                     run_boot = boot
                     run_ts_start = ts
                 run_ts_end = ts
                 run_len += 1
-                if max_abs > run_peak:
-                    run_peak = max_abs
+                if sample_score > run_peak:
+                    run_peak = sample_score
                 run_rms_sum += rms_z
                 if is_pos:
                     run_eval_pos += 1
@@ -579,6 +588,7 @@ def detect_anomalies(
             "anomalous_samples": anomalous_samples,
             "anomalous_pct": (anomalous_samples / total_scored * 100.0) if total_scored else None,
         },
+        "score_mode": score_mode,
         "threshold": threshold,
         "min_samples": min_samples,
         "episodes": episodes,
@@ -654,11 +664,14 @@ def tune_threshold(
     columns: Sequence[str] | None = None,
     control_for: str | None = None,
     group_by: str | None = None,
+    score_mode: str = "max",
     thresholds: Sequence[float] | None = None,
     min_samples: int = 3,
     load_model: str | pathlib.Path | None = None,
 ) -> dict:
     """Évalue une grille de seuils z en une passe et sélectionne le meilleur F1."""
+    if score_mode not in ("max", "rms"):
+        raise ValueError("--score-mode doit valoir 'max' ou 'rms'")
     eval_label = eval_label.strip()
     if not eval_label:
         raise ValueError("--eval-label ne peut pas être vide")
@@ -755,7 +768,9 @@ def tune_threshold(
                 idx += 1
             is_pos = bool(row[idx])
             active_group = grouped_fitted.get(str(grp_val)) if (has_group and grp_val is not None) else None
-            max_abs: float | None = None
+            max_abs = 0.0
+            sq_sum = 0.0
+            n_obs = 0
             for base_fb, val in zip(fitted, values):
                 if val is None:
                     continue
@@ -766,10 +781,14 @@ def tune_threshold(
                     expected = fb.intercept + fb.slope * ctrl_val + fb.center
                 else:
                     expected = fb.center
-                az = abs((val - expected) / fb.scale)
-                if max_abs is None or az > max_abs:
+                z = (val - expected) / fb.scale
+                az = abs(z)
+                if az > max_abs:
                     max_abs = az
-            scored.append((boot, max_abs, is_pos))
+                sq_sum += z * z
+                n_obs += 1
+            sample_score = (math.sqrt(sq_sum / n_obs) if score_mode == "rms" else max_abs) if n_obs > 0 else None
+            scored.append((boot, sample_score, is_pos))
 
     results = [_evaluate_scores_at_threshold(scored, t, min_samples) for t in sorted(set(grid))]
     best = max(
@@ -807,6 +826,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--columns", nargs="+", help="sous-ensemble de métriques numériques")
     parser.add_argument("--control-for", help="métrique de charge/contexte utilisée pour le scoring par résidus")
     parser.add_argument("--group-by", help="colonne de régime discret (ex. is_gaming) pour ajuster un profil par régime")
+    parser.add_argument("--score-mode", choices=("max", "rms"), default="max",
+                        help="agrégation du score par tick : max |z| (défaut) ou rms multivarié")
     parser.add_argument("--threshold", type=float, default=4.0,
                         help="seuil de z-score absolu (défaut : 4.0)")
     parser.add_argument("--min-samples", type=int, default=3,
@@ -851,6 +872,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 columns=args.columns,
                 control_for=args.control_for,
                 group_by=args.group_by,
+                score_mode=args.score_mode,
                 thresholds=args.thresholds,
                 min_samples=args.min_samples,
                 load_model=args.load_model,
@@ -870,6 +892,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 columns=args.columns,
                 control_for=args.control_for,
                 group_by=args.group_by,
+                score_mode=args.score_mode,
                 threshold=args.threshold,
                 min_samples=args.min_samples,
                 event_margin_ms=args.event_margin_ms,

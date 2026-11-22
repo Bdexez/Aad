@@ -15,6 +15,7 @@ import sqlite3
 
 from .analyze import _numeric_metrics, analyze_dataset, audit_labels
 from .database import read_snapshot, sample_filter_sql, validate_time_range
+from .detector import detect_anomalies
 from .report import dataset_report
 from .storage import quote_identifier
 
@@ -93,6 +94,10 @@ def render_html_report(
     since: int | None = None,
     until: int | None = None,
     title: str = "AAD — Rapport de campagne",
+    baseline_label: str | None = None,
+    load_model: str | pathlib.Path | None = None,
+    threshold: float = 4.0,
+    min_samples: int = 3,
 ) -> str:
     """Produit le document HTML complet depuis une base existante en lecture seule."""
     validate_time_range(since, until)
@@ -100,6 +105,18 @@ def render_html_report(
     ana = analyze_dataset(db, boot_id=boot_id, since=since, until=until)
     aud = audit_labels(db, boot_id=boot_id, since=since, until=until)
     sparks = _fetch_sparklines(db, boot_id=boot_id, since=since, until=until)
+    detection = None
+    if baseline_label is not None or load_model is not None:
+        detection = detect_anomalies(
+            db,
+            baseline_label=baseline_label,
+            load_model=load_model,
+            boot_id=boot_id,
+            since=since,
+            until=until,
+            threshold=threshold,
+            min_samples=min_samples,
+        )
 
     esc = html.escape
     samples = rep["samples"]
@@ -123,6 +140,27 @@ def render_html_report(
         f"<td>{esc(str(e['severity'] or ''))}</td><td>{e['count']}</td></tr>"
         for e in rep["events"]
     ) or '<tr><td colspan="4">Aucun événement</td></tr>'
+
+    episodes_section = ""
+    if detection is not None:
+        def _fmt_contribs(items: list[dict]) -> str:
+            return ", ".join(f"{c['column']} (z={c['peak_z']:+.1f})" for c in items)
+
+        ep_rows = "".join(
+            f"<tr><td>{esc(str(ep['boot_id']))}</td>"
+            f"<td>{ep['ts_start']} → {ep['ts_end']}</td>"
+            f"<td>{ep['sample_count']}</td>"
+            f"<td>{ep['peak_score']:.2f}</td>"
+            f"<td>{esc(_fmt_contribs(ep['top_contributors']))}</td>"
+            f"<td>{len(ep.get('events', []))}</td></tr>"
+            for ep in detection["episodes"]
+        ) or '<tr><td colspan="6">Aucun épisode anormal détecté</td></tr>'
+        episodes_section = (
+            f"<h2>Épisodes anormaux détectés ({len(detection['episodes'])})</h2>"
+            "<table><thead><tr><th>Boot</th><th>Fenêtre (epoch ms)</th><th>Mesures</th>"
+            "<th>Pic |z|</th><th>Contributeurs</th><th>Événements</th></tr></thead>"
+            f"<tbody>{ep_rows}</tbody></table>"
+        )
 
     return f"""<!DOCTYPE html>
 <html lang="fr">
@@ -162,6 +200,7 @@ def render_html_report(
 <h2>Événements</h2>
 <table><thead><tr><th>Source</th><th>Genre</th><th>Gravité</th><th>Total</th></tr></thead>
 <tbody>{event_rows}</tbody></table>
+{episodes_section}
 </body>
 </html>
 """
@@ -175,9 +214,17 @@ def write_html_report(
     since: int | None = None,
     until: int | None = None,
     title: str = "AAD — Rapport de campagne",
+    baseline_label: str | None = None,
+    load_model: str | pathlib.Path | None = None,
+    threshold: float = 4.0,
+    min_samples: int = 3,
 ) -> pathlib.Path:
     """Écrit le rapport HTML dans un nouveau fichier (refuse d'écraser l'existant)."""
-    html_text = render_html_report(db, boot_id=boot_id, since=since, until=until, title=title)
+    html_text = render_html_report(
+        db, boot_id=boot_id, since=since, until=until, title=title,
+        baseline_label=baseline_label, load_model=load_model,
+        threshold=threshold, min_samples=min_samples,
+    )
     dest = pathlib.Path(output)
     stream = dest.open("x", encoding="utf-8")
     try:
@@ -197,11 +244,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--since", type=int, help="epoch ms inclusif")
     parser.add_argument("--until", type=int, help="epoch ms exclusif")
     parser.add_argument("--title", default="AAD — Rapport de campagne", help="titre du rapport")
+    parser.add_argument("--baseline-label", help="inclure la détection d'épisodes depuis un label de référence")
+    parser.add_argument("--load-model", type=pathlib.Path, help="inclure la détection depuis un modèle JSON")
+    parser.add_argument("--threshold", type=float, default=4.0, help="seuil z de détection (défaut : 4.0)")
+    parser.add_argument("--min-samples", type=int, default=3, help="longueur minimale d'épisode (défaut : 3)")
     args = parser.parse_args(argv)
     try:
         dest = write_html_report(
             args.db, args.output, boot_id=args.boot_id,
             since=args.since, until=args.until, title=args.title,
+            baseline_label=args.baseline_label, load_model=args.load_model,
+            threshold=args.threshold, min_samples=args.min_samples,
         )
     except (ValueError, OSError, sqlite3.Error) as exc:
         parser.error(f"génération HTML impossible: {exc}")

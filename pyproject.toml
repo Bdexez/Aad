@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aad-collector"
+version = "0.2.0"
+description = "Arch Anomaly Detector — Linux hardware telemetry, context, fault evidence and baseline anomaly detection"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+nvidia = ["nvidia-ml-py>=12.535 ; platform_system == 'Linux'"]
+
+[project.scripts]
+aad = "collector.__main__:main"
+
+[tool.setuptools]
+packages = ["collector", "collector.readers"]

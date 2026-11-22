@@ -889,6 +889,83 @@ def tune_threshold(
     }
 
 
+def benchmark_configs(
+    db: str | pathlib.Path,
+    *,
+    eval_label: str,
+    baseline_label: str | None = None,
+    baseline_boot: str | None = None,
+    baseline_since: int | None = None,
+    baseline_until: int | None = None,
+    boot_id: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+    target_label: str | None = None,
+    columns: Sequence[str] | None = None,
+    control_for: str | None = None,
+    group_by: str | None = None,
+    thresholds: Sequence[float] | None = None,
+    min_samples: int = 3,
+) -> dict:
+    """Compare plusieurs stratégies de détection sur un même dataset labellisé."""
+    variants: list[tuple[str, str | None, str | None]] = [("raw", None, None)]
+    if control_for is not None:
+        variants.append((f"control({control_for})", control_for, None))
+    if group_by is not None:
+        variants.append((f"group({group_by})", None, group_by))
+    if control_for is not None and group_by is not None:
+        variants.append((f"control({control_for})+group({group_by})", control_for, group_by))
+
+    runs: list[dict] = []
+    for name, ctrl, grp in variants:
+        for mode in ("max", "rms"):
+            tuned = tune_threshold(
+                db,
+                eval_label=eval_label,
+                baseline_label=baseline_label,
+                baseline_boot=baseline_boot,
+                baseline_since=baseline_since,
+                baseline_until=baseline_until,
+                boot_id=boot_id,
+                since=since,
+                until=until,
+                target_label=target_label,
+                columns=columns,
+                control_for=ctrl,
+                group_by=grp,
+                score_mode=mode,
+                thresholds=thresholds,
+                min_samples=min_samples,
+            )
+            runs.append({
+                "name": f"{name}/{mode}",
+                "control_for": ctrl,
+                "group_by": grp,
+                "score_mode": mode,
+                "roc_auc": tuned["roc_auc"],
+                "pr_auc": tuned["pr_auc"],
+                "best_threshold": tuned["best"]["threshold"],
+                "best_f1": tuned["best"]["f1"],
+                "best_precision": tuned["best"]["precision"],
+                "best_recall": tuned["best"]["recall"],
+            })
+
+    runs.sort(
+        key=lambda r: (
+            -(r["pr_auc"] if r["pr_auc"] is not None else -1.0),
+            -(r["roc_auc"] if r["roc_auc"] is not None else -1.0),
+            -(r["best_f1"] if r["best_f1"] is not None else -1.0),
+            r["name"],
+        )
+    )
+    return {
+        "eval_label": eval_label,
+        "min_samples": min_samples,
+        "best": runs[0] if runs else None,
+        "runs": runs,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Détecteur statistique d'anomalies AAD (z-score robuste / MAD)"
@@ -921,6 +998,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="exporter les scores d'anomalie par échantillon en CSV")
     parser.add_argument("--tune-threshold", action="store_true",
                         help="calibrer le seuil optimal (F1) sur --eval-label")
+    parser.add_argument("--benchmark", action="store_true",
+                        help="comparer plusieurs stratégies (raw/control-for/group-by × max/rms) sur --eval-label")
     parser.add_argument("--thresholds", nargs="+", type=float,
                         help="grille de seuils personnalisée pour --tune-threshold")
     parser.add_argument("--output", default="-",
@@ -935,12 +1014,34 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--load-model ne se combine pas avec les options --baseline-*")
     if args.load_model is None and not has_baseline_opts:
         parser.error("spécifiez une référence (--baseline-label, --baseline-boot, --baseline-since/--baseline-until ou --load-model)")
-    if args.tune_threshold and not args.eval_label:
-        parser.error("--tune-threshold nécessite --eval-label")
+    if args.tune_threshold and args.benchmark:
+        parser.error("--tune-threshold et --benchmark sont mutuellement exclusifs")
+    if (args.tune_threshold or args.benchmark) and not args.eval_label:
+        parser.error("--tune-threshold et --benchmark nécessitent --eval-label")
+    if args.benchmark and args.load_model is not None:
+        parser.error("--benchmark nécessite une référence --baseline-* (pas --load-model)")
 
     try:
         since, until = resolve_last_minutes(args.last_minutes, args.since, args.until)
-        if args.tune_threshold:
+        if args.benchmark:
+            result = benchmark_configs(
+                args.db,
+                eval_label=args.eval_label,
+                baseline_label=args.baseline_label,
+                baseline_boot=args.baseline_boot,
+                baseline_since=args.baseline_since,
+                baseline_until=args.baseline_until,
+                boot_id=args.boot_id,
+                since=since,
+                until=until,
+                target_label=args.target_label,
+                columns=args.columns,
+                control_for=args.control_for,
+                group_by=args.group_by,
+                thresholds=args.thresholds,
+                min_samples=args.min_samples,
+            )
+        elif args.tune_threshold:
             result = tune_threshold(
                 args.db,
                 eval_label=args.eval_label,
@@ -989,6 +1090,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     def emit_output(stream) -> None:
         if args.json:
             stream.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+            return
+
+        if args.benchmark:
+            fmt = lambda v: "n/a" if v is None else f"{v:.3f}"
+            print(f"Benchmark ({result['eval_label']}, {len(result['runs'])} configurations) :", file=stream)
+            for row in result["runs"]:
+                print(
+                    f"  {row['name']:34} pr_auc={fmt(row['pr_auc'])} roc_auc={fmt(row['roc_auc'])} "
+                    f"best_f1={fmt(row['best_f1'])} (z>={row['best_threshold']})",
+                    file=stream,
+                )
             return
 
         if args.tune_threshold:

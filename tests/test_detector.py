@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 from collector import detector as detector_module
-from collector.detector import detect_anomalies, tune_threshold
+from collector.detector import benchmark_configs, detect_anomalies, tune_threshold
 from collector.main import SCHEMA
 from collector.storage import Storage
 
@@ -351,6 +351,22 @@ class BaselineDetectorTest(unittest.TestCase):
         self.assertIsNotNone(res["evaluation"]["pr_auc"])
         # 1 pic négatif isolé (90°C) devance les 4 positifs (82..88°C) -> AP exacte = (1/2+2/3+3/4+4/5)/4
         self.assertAlmostEqual(res["evaluation"]["pr_auc"], (0.5 + 2 / 3 + 0.75 + 0.8) / 4)
+
+    def test_benchmark_configs_ranks_strategies_by_auc_and_f1(self):
+        self.seed_experiment()
+        bench = benchmark_configs(
+            self.db, baseline_label="normal", since=11000,
+            eval_label="airflow_blocked", thresholds=[2.0, 4.0], min_samples=3,
+        )
+        self.assertEqual(len(bench["runs"]), 2)
+        self.assertIsNotNone(bench["best"])
+        with redirect_stdout(io.StringIO()) as out:
+            detector_module.main([
+                "--db", str(self.db), "--baseline-label", "normal",
+                "--since", "11000", "--eval-label", "airflow_blocked",
+                "--benchmark", "--thresholds", "2.0", "4.0",
+            ])
+        self.assertIn("Benchmark (airflow_blocked", out.getvalue())
 
 
 if __name__ == "__main__":

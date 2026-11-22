@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
+import csv
 from dataclasses import dataclass
 import json
 import math
@@ -258,6 +259,7 @@ def detect_anomalies(
     event_margin_ms: int = 5000,
     load_model: str | pathlib.Path | None = None,
     save_model: str | pathlib.Path | None = None,
+    export_scores: str | pathlib.Path | None = None,
 ) -> dict:
     """Ajuste ou charge une référence robuste et détecte les épisodes anormaux."""
     if score_mode not in ("max", "rms"):
@@ -454,76 +456,105 @@ def detect_anomalies(
         n_feat = len(fitted)
         has_control = control_for is not None
         has_group = group_by is not None
-        for row in cursor:
-            boot = row[0]
-            ts = row[1]
-            values = row[2 : 2 + n_feat]
-            idx = 2 + n_feat
-            ctrl_val = row[idx] if has_control else None
-            if has_control:
-                idx += 1
-            grp_val = row[idx] if has_group else None
-            if has_group:
-                idx += 1
-            is_pos = bool(row[idx]) if eval_label is not None else False
-            total_scored += 1
 
-            if run_len > 0 and boot != run_boot:
-                flush_run()
+        scores_path = pathlib.Path(export_scores) if export_scores is not None else None
+        scores_stream = scores_path.open("x", encoding="utf-8", newline="") if scores_path is not None else None
+        scores_writer = csv.writer(scores_stream, lineterminator="\n") if scores_stream is not None else None
+        if scores_writer is not None:
+            scores_writer.writerow(["ts", "boot_id", "score", "max_abs_z", "rms_z", "top_sensor", "exceeds_threshold"])
+        try:
+            for row in cursor:
+                boot = row[0]
+                ts = row[1]
+                values = row[2 : 2 + n_feat]
+                idx = 2 + n_feat
+                ctrl_val = row[idx] if has_control else None
+                if has_control:
+                    idx += 1
+                grp_val = row[idx] if has_group else None
+                if has_group:
+                    idx += 1
+                is_pos = bool(row[idx]) if eval_label is not None else False
+                total_scored += 1
 
-            active_group = grouped_fitted.get(str(grp_val)) if (has_group and grp_val is not None) else None
-            max_abs = 0.0
-            sq_sum = 0.0
-            n_obs = 0
-            z_obs: list[tuple[FeatureBaseline, float, float, float]] = []
-            for base_fb, val in zip(fitted, values):
-                if val is None:
-                    continue
-                fb = active_group.get(base_fb.column, base_fb) if active_group is not None else base_fb
-                if fb.intercept is not None:
-                    if ctrl_val is None:
+                if run_len > 0 and boot != run_boot:
+                    flush_run()
+
+                active_group = grouped_fitted.get(str(grp_val)) if (has_group and grp_val is not None) else None
+                max_abs = 0.0
+                top_sensor = ""
+                sq_sum = 0.0
+                n_obs = 0
+                z_obs: list[tuple[FeatureBaseline, float, float, float]] = []
+                for base_fb, val in zip(fitted, values):
+                    if val is None:
                         continue
-                    expected = fb.intercept + fb.slope * ctrl_val + fb.center
-                else:
-                    expected = fb.center
-                z = (val - expected) / fb.scale
-                az = abs(z)
-                if az > max_abs:
-                    max_abs = az
-                sq_sum += z * z
-                n_obs += 1
-                z_obs.append((fb, z, val, expected))
-
-            if n_obs > 0:
-                rms_z = math.sqrt(sq_sum / n_obs)
-                sample_score = rms_z if score_mode == "rms" else max_abs
-            else:
-                rms_z = 0.0
-                sample_score = 0.0
-
-            if n_obs > 0 and sample_score >= threshold:
-                if run_len == 0:
-                    run_boot = boot
-                    run_ts_start = ts
-                run_ts_end = ts
-                run_len += 1
-                if sample_score > run_peak:
-                    run_peak = sample_score
-                run_rms_sum += rms_z
-                if is_pos:
-                    run_eval_pos += 1
-                for fb, z, val, expected in z_obs:
-                    az = abs(z)
-                    prev = run_contrib.get(fb.column)
-                    if prev is None or az > prev[0]:
-                        run_contrib[fb.column] = (az, z, val, expected)
-            else:
-                flush_run()
-                if eval_label is not None:
-                    if is_pos:
-                        fn += 1
+                    fb = active_group.get(base_fb.column, base_fb) if active_group is not None else base_fb
+                    if fb.intercept is not None:
+                        if ctrl_val is None:
+                            continue
+                        expected = fb.intercept + fb.slope * ctrl_val + fb.center
                     else:
-                        tn += 1
+                        expected = fb.center
+                    z = (val - expected) / fb.scale
+                    az = abs(z)
+                    if az > max_abs:
+                        max_abs = az
+                        top_sensor = fb.column
+                    sq_sum += z * z
+                    n_obs += 1
+                    z_obs.append((fb, z, val, expected))
+
+                if n_obs > 0:
+                    rms_z = math.sqrt(sq_sum / n_obs)
+                    sample_score = rms_z if score_mode == "rms" else max_abs
+                else:
+                    rms_z = 0.0
+                    sample_score = 0.0
+
+                exceeds = n_obs > 0 and sample_score >= threshold
+                if scores_writer is not None:
+                    scores_writer.writerow([
+                        ts,
+                        boot,
+                        f"{sample_score:.6f}" if n_obs > 0 else "",
+                        f"{max_abs:.6f}" if n_obs > 0 else "",
+                        f"{rms_z:.6f}" if n_obs > 0 else "",
+                        top_sensor,
+                        int(exceeds),
+                    ])
+
+                if exceeds:
+                    if run_len == 0:
+                        run_boot = boot
+                        run_ts_start = ts
+                    run_ts_end = ts
+                    run_len += 1
+                    if sample_score > run_peak:
+                        run_peak = sample_score
+                    run_rms_sum += rms_z
+                    if is_pos:
+                        run_eval_pos += 1
+                    for fb, z, val, expected in z_obs:
+                        az = abs(z)
+                        prev = run_contrib.get(fb.column)
+                        if prev is None or az > prev[0]:
+                            run_contrib[fb.column] = (az, z, val, expected)
+                else:
+                    flush_run()
+                    if eval_label is not None:
+                        if is_pos:
+                            fn += 1
+                        else:
+                            tn += 1
+        except BaseException:
+            if scores_stream is not None:
+                scores_stream.close()
+            if scores_path is not None:
+                scores_path.unlink(missing_ok=True)
+            raise
+        if scores_stream is not None:
+            scores_stream.close()
 
         flush_run()
 
@@ -836,6 +867,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="marge (ms) pour associer les événements autour d'un épisode (défaut : 5000)")
     parser.add_argument("--save-model", type=pathlib.Path, help="sauvegarder le modèle ajusté en JSON")
     parser.add_argument("--load-model", type=pathlib.Path, help="charger un modèle JSON existant")
+    parser.add_argument("--export-scores", type=pathlib.Path,
+                        help="exporter les scores d'anomalie par échantillon en CSV")
     parser.add_argument("--tune-threshold", action="store_true",
                         help="calibrer le seuil optimal (F1) sur --eval-label")
     parser.add_argument("--thresholds", nargs="+", type=float,
@@ -898,6 +931,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 event_margin_ms=args.event_margin_ms,
                 load_model=args.load_model,
                 save_model=args.save_model,
+                export_scores=args.export_scores,
             )
     except (ValueError, OSError, sqlite3.Error) as exc:
         parser.error(str(exc))

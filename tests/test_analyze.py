@@ -20,6 +20,7 @@ from collector.analyze import (
     correlate_metric,
     detect_changepoints,
     detect_collinearity,
+    detect_missing_blocks,
     detect_outliers,
     detect_stuck_runs,
 )
@@ -425,6 +426,26 @@ class AnalyzeDatasetTest(unittest.TestCase):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exc:
             analyze_module.main(["--db", str(self.db), "--drift", "--markdown"])
         self.assertEqual(exc.exception.code, 2)
+
+    def test_detect_missing_blocks_identifies_contiguous_null_dropouts(self):
+        self.storage.insert_samples([
+            {"ts": 1000, "boot_id": "a", "temp_c": 45.0},
+            {"ts": 2000, "boot_id": "a", "temp_c": None},
+            {"ts": 3000, "boot_id": "a", "temp_c": None},
+            {"ts": 4000, "boot_id": "a", "temp_c": None},
+            {"ts": 5000, "boot_id": "a", "temp_c": 46.0},
+            {"ts": 6000, "boot_id": "b", "temp_c": None},
+            {"ts": 7000, "boot_id": "b", "temp_c": None},
+        ])
+        res = detect_missing_blocks(self.db, min_run=3, columns=["temp_c"])
+        self.assertEqual(len(res["missing_blocks"]), 1)
+        b = res["missing_blocks"][0]
+        self.assertEqual(b["longest_block"], 3)
+        self.assertEqual(b["longest_boot"], "a")
+
+        with redirect_stdout(io.StringIO()) as out:
+            analyze_module.main(["--db", str(self.db), "--missing-blocks", "--min-missing", "3", "--columns", "temp_c"])
+        self.assertIn("max=3", out.getvalue())
 
 
 if __name__ == "__main__":

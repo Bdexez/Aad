@@ -1130,6 +1130,105 @@ def detect_collinearity(
     }
 
 
+def detect_missing_blocks(
+    db: str | pathlib.Path,
+    *,
+    boot_id: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+    min_run: int = 5,
+    columns: Sequence[str] | None = None,
+) -> dict:
+    """Détecte les coupures contiguës de valeurs NULL par métrique numérique et par boot.
+
+    Utile pour repérer une sonde disparue à chaud (GPU en runtime PM, pilote
+    hwmon déchargé) ou un reader désactivé en cours de collecte.
+    """
+    if min_run < 1:
+        raise ValueError("--min-missing doit être >= 1")
+    validate_time_range(since, until)
+    where, params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
+    with read_snapshot(db) as conn:
+        metrics, order_col = _numeric_metrics(conn)
+        numeric_names = [name for name, _ in metrics]
+        if columns is not None:
+            selected = list(columns)
+            if not selected:
+                raise ValueError("aucune colonne sélectionnée")
+            unknown = set(selected) - set(numeric_names)
+            if unknown:
+                raise ValueError(f"métriques numériques introuvables: {', '.join(sorted(unknown))}")
+        else:
+            selected = numeric_names
+
+        blocks: list[dict] = []
+        if selected:
+            proj = ", ".join(f"s.{quote_identifier(c)}" for c in selected)
+            cursor = conn.execute(
+                f"SELECT s.boot_id, s.ts, {proj} FROM samples AS s{where}"
+                f" ORDER BY s.boot_id, s.{quote_identifier(order_col)}",
+                params,
+            )
+            # [cur_len, start_ts, end_ts]
+            state: list[list] = [[0, None, None] for _ in selected]
+            # [block_count, missing_samples, longest_len, longest_boot, longest_start, longest_end]
+            agg: list[list] = [[0, 0, 0, None, None, None] for _ in selected]
+            current_boot: str | None = None
+
+            def flush_col(idx: int, boot_name: str | None) -> None:
+                length, start_ts, end_ts = state[idx]
+                if length >= min_run:
+                    a = agg[idx]
+                    a[0] += 1
+                    a[1] += length
+                    if length > a[2]:
+                        a[2] = length
+                        a[3] = boot_name
+                        a[4] = start_ts
+                        a[5] = end_ts
+                state[idx] = [0, None, None]
+
+            for row in cursor:
+                boot, ts = row[0], row[1]
+                if boot != current_boot:
+                    if current_boot is not None:
+                        for i in range(len(selected)):
+                            flush_col(i, current_boot)
+                    current_boot = boot
+                for i, val in enumerate(row[2:]):
+                    if val is None:
+                        if state[i][0] == 0:
+                            state[i] = [1, ts, ts]
+                        else:
+                            state[i][0] += 1
+                            state[i][2] = ts
+                    else:
+                        flush_col(i, current_boot)
+            if current_boot is not None:
+                for i in range(len(selected)):
+                    flush_col(i, current_boot)
+
+            for col, a in zip(selected, agg):
+                if a[0] > 0:
+                    blocks.append({
+                        "column": col,
+                        "block_count": a[0],
+                        "missing_samples": a[1],
+                        "longest_block": a[2],
+                        "longest_boot": a[3],
+                        "longest_ts_start": a[4],
+                        "longest_ts_end": a[5],
+                    })
+            blocks.sort(key=lambda item: (-item["longest_block"], item["column"]))
+
+    return {
+        "boot_id": boot_id,
+        "window": {"since": since, "until": until},
+        "min_run": min_run,
+        "missing_blocks": blocks,
+    }
+
+
 def _fmt(value: float | None, digits: int = 2) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
 
@@ -1190,7 +1289,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="seuil de score de Welch pour --changepoints (défaut : 4.0)")
     parser.add_argument("--r-threshold", type=float, default=0.95,
                         help="seuil |r| pour --collinear (défaut : 0.95)")
-    parser.add_argument("--columns", nargs="+", help="sous-ensemble de métriques (pour --outliers, --by, --stuck-runs, --collinear)")
+    parser.add_argument("--min-missing", type=int, default=5,
+                        help="longueur minimale d'une coupure NULL pour --missing-blocks (défaut : 5)")
+    parser.add_argument("--columns", nargs="+", help="sous-ensemble de métriques (pour --outliers, --by, --stuck-runs, --collinear, --missing-blocks)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--compare", nargs=2, metavar=("BASELINE", "TARGET"),
                       help="comparer les métriques numériques entre deux labels")
@@ -1212,6 +1313,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                       help="localiser les ruptures de régime d'une métrique par fenêtre glissante")
     mode.add_argument("--collinear", action="store_true",
                       help="lister les paires de sondes numériques redondantes (|r| >= --r-threshold)")
+    mode.add_argument("--missing-blocks", action="store_true",
+                      help="détecter les coupures contiguës de valeurs NULL par métrique")
     output_fmt = parser.add_mutually_exclusive_group()
     output_fmt.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
     output_fmt.add_argument("--markdown", action="store_true",
@@ -1219,7 +1322,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.markdown and any((
         args.compare, args.correlate, args.outliers, args.check_labels,
-        args.drift, args.by, args.check_bounds, args.stuck_runs, args.changepoints, args.collinear,
+        args.drift, args.by, args.check_bounds, args.stuck_runs, args.changepoints,
+        args.collinear, args.missing_blocks,
     )):
         parser.error("--markdown s'applique uniquement au mode exploratoire par défaut")
 
@@ -1274,6 +1378,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.db, boot_id=args.boot_id, since=since, until=until,
                 r_threshold=args.r_threshold, min_pairs=args.min_pairs, columns=args.columns,
             )
+        elif args.missing_blocks:
+            result = detect_missing_blocks(
+                args.db, boot_id=args.boot_id, since=since, until=until,
+                min_run=args.min_missing, columns=args.columns,
+            )
         else:
             result = analyze_dataset(
                 args.db, boot_id=args.boot_id, since=since,
@@ -1288,6 +1397,15 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.markdown:
         print(format_markdown(result))
+        return
+
+    if args.missing_blocks:
+        print(f"Coupures NULL (>= {result['min_run']} mesures consécutives) :")
+        for item in result["missing_blocks"]:
+            print(
+                f"  {item['column']} : {item['block_count']} coupure(s), "
+                f"max={item['longest_block']} (boot={item['longest_boot']})"
+            )
         return
 
     if args.collinear:

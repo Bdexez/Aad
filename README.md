@@ -85,7 +85,7 @@ Inspect sampling cadence, numeric distributions, constant sensors and experiment
 ```bash
 python -m collector.analyze --db data/metrics.db
 python -m collector.analyze --db data/metrics.db --compare normal airflow_blocked
-python -m collector.analyze --db data/metrics.db --correlate k10temp_tctl
+python -m collector.analyze --db data/metrics.db --correlate k10temp_tctl --method spearman
 python -m collector.analyze --db data/metrics.db --outliers --z-threshold 3.5
 python -m collector.analyze --db data/metrics.db --drift --slices 2
 python -m collector.analyze --db data/metrics.db --by is_gaming
@@ -98,9 +98,12 @@ python -m collector.analyze --db data/metrics.db --thermal-profile k10temp_tctl 
 python -m collector.analyze --db data/metrics.db --clipping --clip-pct 10
 python -m collector.analyze --db data/metrics.db --collinear --r-threshold 0.95
 python -m collector.analyze --db data/metrics.db --event-impact thermal_trip
+python -m collector.analyze --db data/metrics.db --core-skew
+python -m collector.analyze --db data/metrics.db --event-bursts
+python -m collector.analyze --db data/metrics.db --describe-schema
 python -m collector.analyze --db data/metrics.db --compare-boots BOOT_A BOOT_B
 python -m collector.analyze --db data/metrics.db --check-labels
-python -m collector.summary --db data/metrics.db --markdown
+python -m collector.summary --db data/metrics.db --latest-boot --markdown
 python -m collector.html_report --db data/metrics.db --baseline-label normal --output data/report.html
 python -m collector.analyze --db data/metrics.db --last-minutes 60 --json
 ```

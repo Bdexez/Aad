@@ -24,6 +24,7 @@ from .analysis_core import (
     _numeric_metrics,
     _percentage,
     _quantile,
+    _spearman_lists,
 )
 from .database import read_snapshot, resolve_boot_id, resolve_last_minutes, sample_filter_sql, validate_time_range
 from .storage import quote_identifier
@@ -268,16 +269,22 @@ def correlate_metric(
     since: int | None = None,
     until: int | None = None,
     min_pairs: int = 3,
+    method: str = "pearson",
 ) -> dict:
-    """Corrélation de Pearson entre une métrique cible et les autres sondes numériques.
+    """Corrélation de Pearson ou Spearman entre une métrique cible et les autres sondes.
 
-    Calculée en deux passes SQLite sur l'intersection non-NULL de chaque paire
-    (O(1) mémoire Python), sans imputation des valeurs manquantes.
+    En mode Pearson (défaut), le calcul s'effectue en deux passes SQLite sur
+    l'intersection non-NULL de chaque paire (O(1) mémoire Python). En mode
+    Spearman, la corrélation de rang capture les relations monotones non linéaires
+    (ex. courbe ventilateur vs température), sans imputation des valeurs manquantes.
     """
     if min_pairs < 2:
         raise ValueError("--min-pairs doit être >= 2")
+    if method not in {"pearson", "spearman"}:
+        raise ValueError("--method doit valoir 'pearson' ou 'spearman'")
     validate_time_range(since, until)
     where, params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
+    prefix = (where + " AND ") if where else " WHERE "
     with read_snapshot(db) as conn:
         metrics, _ = _numeric_metrics(conn)
         numeric_names = [name for name, _ in metrics]
@@ -286,7 +293,29 @@ def correlate_metric(
         others = [name for name in numeric_names if name != target_column]
         qt = quote_identifier(target_column)
         correlations: list[dict] = []
-        if others:
+        if others and method == "spearman":
+            for col in others:
+                qc = quote_identifier(col)
+                rows = conn.execute(
+                    f"SELECT {qt}, {qc} FROM samples AS s{prefix}{qt} IS NOT NULL AND {qc} IS NOT NULL",
+                    params,
+                ).fetchall()
+                pairs = len(rows)
+                r = _spearman_lists([float(a) for a, _ in rows], [float(b) for _, b in rows]) if pairs >= min_pairs else None
+                correlations.append({
+                    "column": col,
+                    "pairs": pairs,
+                    "r": r,
+                    "r_squared": None if r is None else r * r,
+                })
+            correlations.sort(
+                key=lambda item: (
+                    item["r"] is None,
+                    -(abs(item["r"]) if item["r"] is not None else 0.0),
+                    item["column"],
+                )
+            )
+        elif others:
             p1_exprs = []
             for col in others:
                 qc = quote_identifier(col)
@@ -352,6 +381,7 @@ def correlate_metric(
         "boot_id": boot_id,
         "window": {"since": since, "until": until},
         "target": target_column,
+        "method": method,
         "min_pairs": min_pairs,
         "correlations": correlations,
     }
@@ -971,6 +1001,7 @@ def detect_collinearity(
     r_threshold: float = 0.95,
     min_pairs: int = 3,
     columns: Sequence[str] | None = None,
+    method: str = "pearson",
 ) -> dict:
     """Identifie les paires de sondes numériques redondantes (|r| >= r_threshold).
 
@@ -981,8 +1012,11 @@ def detect_collinearity(
         raise ValueError("--r-threshold doit être dans ]0, 1]")
     if min_pairs < 2:
         raise ValueError("--min-pairs doit être >= 2")
+    if method not in {"pearson", "spearman"}:
+        raise ValueError("--method doit valoir 'pearson' ou 'spearman'")
     validate_time_range(since, until)
     where, params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
+    prefix = (where + " AND ") if where else " WHERE "
     with read_snapshot(db) as conn:
         metrics, _ = _numeric_metrics(conn)
         numeric_names = [name for name, _ in metrics]
@@ -1002,28 +1036,40 @@ def detect_collinearity(
             for col_b in selected[i + 1 :]:
                 qb = quote_identifier(col_b)
                 cond = f"{qa} IS NOT NULL AND {qb} IS NOT NULL"
-                n, ma, mb = conn.execute(
-                    f"SELECT COUNT(CASE WHEN {cond} THEN 1 END),"
-                    f" AVG(CASE WHEN {cond} THEN {qa} END),"
-                    f" AVG(CASE WHEN {cond} THEN {qb} END)"
-                    f" FROM samples AS s{where}",
-                    params,
-                ).fetchone()
-                if n < min_pairs or ma is None or mb is None:
-                    continue
-                sxy, sxx, syy = conn.execute(
-                    f"SELECT SUM(CASE WHEN {cond} THEN ({qa} - ?) * ({qb} - ?) END),"
-                    f" SUM(CASE WHEN {cond} THEN ({qa} - ?) * ({qa} - ?) END),"
-                    f" SUM(CASE WHEN {cond} THEN ({qb} - ?) * ({qb} - ?) END)"
-                    f" FROM samples AS s{where}",
-                    [ma, mb, ma, ma, mb, mb, *params],
-                ).fetchone()
-                if sxy is None or sxx is None or syy is None:
-                    continue
-                denom = math.sqrt(max(0.0, sxx) * max(0.0, syy))
-                if denom <= 0.0:
-                    continue
-                r = max(-1.0, min(1.0, sxy / denom))
+                if method == "spearman":
+                    rows = conn.execute(
+                        f"SELECT {qa}, {qb} FROM samples AS s{prefix}{cond}",
+                        params,
+                    ).fetchall()
+                    n = len(rows)
+                    if n < min_pairs:
+                        continue
+                    r = _spearman_lists([float(a) for a, _ in rows], [float(b) for _, b in rows])
+                    if r is None:
+                        continue
+                else:
+                    n, ma, mb = conn.execute(
+                        f"SELECT COUNT(CASE WHEN {cond} THEN 1 END),"
+                        f" AVG(CASE WHEN {cond} THEN {qa} END),"
+                        f" AVG(CASE WHEN {cond} THEN {qb} END)"
+                        f" FROM samples AS s{where}",
+                        params,
+                    ).fetchone()
+                    if n < min_pairs or ma is None or mb is None:
+                        continue
+                    sxy, sxx, syy = conn.execute(
+                        f"SELECT SUM(CASE WHEN {cond} THEN ({qa} - ?) * ({qb} - ?) END),"
+                        f" SUM(CASE WHEN {cond} THEN ({qa} - ?) * ({qa} - ?) END),"
+                        f" SUM(CASE WHEN {cond} THEN ({qb} - ?) * ({qb} - ?) END)"
+                        f" FROM samples AS s{where}",
+                        [ma, mb, ma, ma, mb, mb, *params],
+                    ).fetchone()
+                    if sxy is None or sxx is None or syy is None:
+                        continue
+                    denom = math.sqrt(max(0.0, sxx) * max(0.0, syy))
+                    if denom <= 0.0:
+                        continue
+                    r = max(-1.0, min(1.0, sxy / denom))
                 if abs(r) >= r_threshold:
                     pairs_found.append({
                         "column_a": col_a,
@@ -1037,6 +1083,7 @@ def detect_collinearity(
     return {
         "boot_id": boot_id,
         "window": {"since": since, "until": until},
+        "method": method,
         "r_threshold": r_threshold,
         "min_pairs": min_pairs,
         "collinear_pairs": pairs_found,
@@ -1807,6 +1854,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="multiple de la cadence médiane définissant un trou (défaut : 2.0)")
     parser.add_argument("--min-pairs", type=int, default=3,
                         help="paires minimales pour calculer une corrélation (défaut : 3)")
+    parser.add_argument("--method", choices=("pearson", "spearman"), default="pearson",
+                        help="méthode de corrélation pour --correlate et --collinear (défaut : pearson)")
     parser.add_argument("--z-threshold", type=float, default=3.5,
                         help="seuil de z-score modifié (MAD) pour --outliers (défaut : 3.5)")
     parser.add_argument("--slices", type=int, default=2,
@@ -1899,7 +1948,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             result = correlate_metric(
                 args.db, args.correlate,
                 boot_id=boot_id, since=since, until=until,
-                min_pairs=args.min_pairs,
+                min_pairs=args.min_pairs, method=args.method,
             )
         elif args.outliers:
             result = detect_outliers(
@@ -1937,7 +1986,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         elif args.collinear:
             result = detect_collinearity(
                 args.db, boot_id=boot_id, since=since, until=until,
-                r_threshold=args.r_threshold, min_pairs=args.min_pairs, columns=args.columns,
+                r_threshold=args.r_threshold, min_pairs=args.min_pairs,
+                columns=args.columns, method=args.method,
             )
         elif args.missing_blocks:
             result = detect_missing_blocks(
@@ -2170,7 +2220,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
 
     if args.correlate:
-        print(f"Corrélations de Pearson avec {result['target']} (min_pairs={result['min_pairs']}) :")
+        label = "Spearman" if result["method"] == "spearman" else "Pearson"
+        print(f"Corrélations de {label} avec {result['target']} (min_pairs={result['min_pairs']}) :")
         for item in result["correlations"]:
             print(
                 f"  {item['column']} : r={_fmt(item['r'], 3)}, "

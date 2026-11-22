@@ -88,6 +88,16 @@ class FeatureEngineeringTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             export_features(self.db, io.StringIO(), split_ratios=(0.0, 0.0, 0.0))
 
+    def test_exclude_columns_drops_selected_metrics_and_rejects_columns_conflict(self):
+        self.storage.insert_samples([{"ts": 1000, "boot_id": "a", "temp_c": 42.0, "gpu_throttle_mask": 0.0}])
+        out = io.StringIO()
+        export_features(self.db, out, fmt="jsonl", exclude_columns=["gpu_throttle_mask"])
+        rec = json.loads(out.getvalue().splitlines()[0])
+        self.assertIn("temp_c", rec)
+        self.assertNotIn("gpu_throttle_mask", rec)
+        with self.assertRaises(ValueError):
+            export_features(self.db, io.StringIO(), columns=["temp_c"], exclude_columns=["gpu_throttle_mask"])
+
 
 if __name__ == "__main__":
     unittest.main()

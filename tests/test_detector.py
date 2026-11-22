@@ -401,6 +401,16 @@ class BaselineDetectorTest(unittest.TestCase):
         self.assertEqual(len(lines), 3)
         self.assertTrue(lines[0].startswith("threshold,episodes,tp,fp,fn,tn,tpr,fpr,precision,recall,f1"))
 
+        # Lissage --smooth 3 : un pic isolé est atténué, un épisode soutenu reste détecté
+        smoothed = detect_anomalies(
+            self.db, baseline_label="normal", since=11000,
+            smooth=3, threshold=4.0, min_samples=3,
+        )
+        self.assertEqual(smoothed["smooth"], 3)
+        self.assertEqual(len(smoothed["episodes"]), 1)
+        with self.assertRaises(ValueError):
+            detect_anomalies(self.db, baseline_label="normal", smooth=0)
+
 
 if __name__ == "__main__":
     unittest.main()

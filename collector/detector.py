@@ -9,6 +9,7 @@ consécutifs en épisodes et identifie les capteurs contributeurs principaux.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from collections.abc import Sequence
 import csv
 from dataclasses import dataclass
@@ -295,6 +296,7 @@ def detect_anomalies(
     control_for: str | None = None,
     group_by: str | None = None,
     score_mode: str = "max",
+    smooth: int = 1,
     threshold: float = 4.0,
     min_samples: int = 3,
     top_contributors: int = 3,
@@ -308,6 +310,8 @@ def detect_anomalies(
         raise ValueError("--columns et --exclude-columns sont mutuellement exclusifs")
     if score_mode not in ("max", "rms"):
         raise ValueError("--score-mode doit valoir 'max' ou 'rms'")
+    if smooth < 1:
+        raise ValueError("--smooth doit être >= 1")
     if not math.isfinite(threshold) or threshold <= 0:
         raise ValueError("--threshold doit être un nombre fini > 0")
     if min_samples < 1:
@@ -510,6 +514,8 @@ def detect_anomalies(
         scores_writer = csv.writer(scores_stream, lineterminator="\n") if scores_stream is not None else None
         if scores_writer is not None:
             scores_writer.writerow(["ts", "boot_id", "score", "max_abs_z", "rms_z", "top_sensor", "exceeds_threshold"])
+        smooth_window: deque[float] = deque(maxlen=smooth)
+        last_boot: str | None = None
         try:
             for row in cursor:
                 boot = row[0]
@@ -525,6 +531,9 @@ def detect_anomalies(
                 is_pos = bool(row[idx]) if eval_label is not None else False
                 total_scored += 1
 
+                if boot != last_boot:
+                    smooth_window.clear()
+                    last_boot = boot
                 if run_len > 0 and boot != run_boot:
                     flush_run()
 
@@ -555,7 +564,9 @@ def detect_anomalies(
 
                 if n_obs > 0:
                     rms_z = math.sqrt(sq_sum / n_obs)
-                    sample_score = rms_z if score_mode == "rms" else max_abs
+                    raw_score = rms_z if score_mode == "rms" else max_abs
+                    smooth_window.append(raw_score)
+                    sample_score = sum(smooth_window) / len(smooth_window)
                     if eval_label is not None:
                         eval_scores.append((sample_score, is_pos))
                 else:
@@ -670,6 +681,7 @@ def detect_anomalies(
             "anomalous_pct": (anomalous_samples / total_scored * 100.0) if total_scored else None,
         },
         "score_mode": score_mode,
+        "smooth": smooth,
         "threshold": threshold,
         "min_samples": min_samples,
         "episodes": episodes,
@@ -1082,6 +1094,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--group-by", help="colonne de régime discret (ex. is_gaming) pour ajuster un profil par régime")
     parser.add_argument("--score-mode", choices=("max", "rms"), default="max",
                         help="agrégation du score par tick : max |z| (défaut) ou rms multivarié")
+    parser.add_argument("--smooth", type=int, default=1,
+                        help="lissage par moyenne mobile sur N ticks du score (défaut : 1)")
     parser.add_argument("--threshold", type=float, default=4.0,
                         help="seuil de z-score absolu (défaut : 4.0)")
     parser.add_argument("--min-samples", type=int, default=3,
@@ -1189,6 +1203,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 control_for=args.control_for,
                 group_by=args.group_by,
                 score_mode=args.score_mode,
+                smooth=args.smooth,
                 threshold=args.threshold,
                 min_samples=args.min_samples,
                 event_margin_ms=args.event_margin_ms,

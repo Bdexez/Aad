@@ -12,7 +12,7 @@ import sqlite3
 import sys
 from typing import TextIO
 
-from .database import read_snapshot, sample_filter_sql, validate_time_range
+from .database import read_snapshot, resolve_last_minutes, sample_filter_sql, validate_time_range
 from .storage import quote_identifier
 
 
@@ -278,6 +278,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--boot", dest="boot_id", help="limiter les mesures à un boot_id")
     parser.add_argument("--since", type=int, help="epoch ms inclusif")
     parser.add_argument("--until", type=int, help="epoch ms exclusif")
+    parser.add_argument("--last-minutes", type=float, help="limiter aux N dernières minutes")
     parser.add_argument("--columns", nargs="+", help="colonnes de mesures à exporter, dans l'ordre choisi")
     parser.add_argument("--bucket-ms", type=int, help="ré-échantillonner par fenêtres de N ms (moyenne SQLite)")
     parser.add_argument("--source", help="filtrer les événements par source (avec --events)")
@@ -289,27 +290,28 @@ def main(argv: Sequence[str] | None = None) -> None:
     if not args.events and any(v is not None for v in (args.source, args.kind, args.severity)):
         parser.error("--source, --kind et --severity nécessitent --events")
     try:
+        since, until = resolve_last_minutes(args.last_minutes, args.since, args.until)
         with _output(args.output) as target:
             if args.events:
                 count = export_events(
-                    args.db, target, fmt=args.format, since=args.since, until=args.until,
+                    args.db, target, fmt=args.format, since=since, until=until,
                     source=args.source, kind=args.kind, severity=args.severity,
                 )
             elif args.bucket_ms is not None:
                 count = export_downsampled(
                     args.db, target, bucket_ms=args.bucket_ms, fmt=args.format,
-                    boot_id=args.boot_id, since=args.since, until=args.until,
+                    boot_id=args.boot_id, since=since, until=until,
                     columns=args.columns,
                 )
             elif args.format == "jsonl":
                 count = export_jsonl(
-                    args.db, target, boot_id=args.boot_id, since=args.since,
-                    until=args.until, columns=args.columns,
+                    args.db, target, boot_id=args.boot_id, since=since,
+                    until=until, columns=args.columns,
                 )
             else:
                 count = export_csv(
-                    args.db, target, boot_id=args.boot_id, since=args.since,
-                    until=args.until, columns=args.columns,
+                    args.db, target, boot_id=args.boot_id, since=since,
+                    until=until, columns=args.columns,
                 )
             target.flush()
     except (ValueError, OSError, sqlite3.Error) as exc:

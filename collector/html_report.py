@@ -14,7 +14,7 @@ import pathlib
 import sqlite3
 
 from .analyze import _numeric_metrics, analyze_dataset, audit_labels
-from .database import read_snapshot, sample_filter_sql, validate_time_range
+from .database import read_snapshot, resolve_last_minutes, sample_filter_sql, validate_time_range
 from .detector import detect_anomalies
 from .report import dataset_report
 from .storage import quote_identifier
@@ -243,6 +243,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--boot", dest="boot_id", help="limiter à un boot_id")
     parser.add_argument("--since", type=int, help="epoch ms inclusif")
     parser.add_argument("--until", type=int, help="epoch ms exclusif")
+    parser.add_argument("--last-minutes", type=float, help="limiter aux N dernières minutes")
     parser.add_argument("--title", default="AAD — Rapport de campagne", help="titre du rapport")
     parser.add_argument("--baseline-label", help="inclure la détection d'épisodes depuis un label de référence")
     parser.add_argument("--load-model", type=pathlib.Path, help="inclure la détection depuis un modèle JSON")
@@ -250,9 +251,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--min-samples", type=int, default=3, help="longueur minimale d'épisode (défaut : 3)")
     args = parser.parse_args(argv)
     try:
+        since, until = resolve_last_minutes(args.last_minutes, args.since, args.until)
         dest = write_html_report(
             args.db, args.output, boot_id=args.boot_id,
-            since=args.since, until=args.until, title=args.title,
+            since=since, until=until, title=args.title,
             baseline_label=args.baseline_label, load_model=args.load_model,
             threshold=args.threshold, min_samples=args.min_samples,
         )

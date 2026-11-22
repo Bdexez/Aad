@@ -4,6 +4,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 import pathlib
+import sqlite3
 import tempfile
 import unittest
 
@@ -76,6 +77,28 @@ class MergeDatabasesTest(unittest.TestCase):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exc:
             merge_module.main(["--output", str(self.root / "x.db"), str(self.db1)])
         self.assertEqual(exc.exception.code, 2)
+
+    def test_merges_legacy_ts_primary_key_database_without_migrating_source(self):
+        legacy = self.root / "legacy.db"
+        with sqlite3.connect(legacy) as conn:
+            conn.executescript(
+                "CREATE TABLE samples (ts INTEGER PRIMARY KEY, boot_id TEXT NOT NULL, temp_c REAL);"
+                "CREATE TABLE boots (boot_id TEXT PRIMARY KEY, ts_first INTEGER NOT NULL, kernel TEXT, notes TEXT);"
+                "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,"
+                " source TEXT NOT NULL, kind TEXT NOT NULL, severity TEXT, message TEXT);"
+                "CREATE TABLE labels (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_start INTEGER NOT NULL,"
+                " ts_end INTEGER, label TEXT NOT NULL, notes TEXT);"
+                "INSERT INTO boots VALUES ('legacy-boot', 500, '6.6', NULL);"
+                "INSERT INTO samples VALUES (500, 'legacy-boot', 38.5);"
+                "INSERT INTO events (ts, source, kind, severity, message) VALUES (500, 'kmsg', 'mce', 'error', 'old');"
+            )
+        conn.close()
+        before = legacy.read_bytes()
+        dest = self.root / "merged_legacy.db"
+        res = merge_databases([legacy, self.db1], dest)
+        self.assertEqual(res["samples"], 2)
+        self.assertEqual(res["events_inserted"], 2)
+        self.assertEqual(legacy.read_bytes(), before)
 
 
 if __name__ == "__main__":

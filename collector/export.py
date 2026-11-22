@@ -12,7 +12,7 @@ import sqlite3
 import sys
 from typing import TextIO
 
-from .database import read_snapshot, resolve_last_minutes, sample_filter_sql, validate_time_range
+from .database import read_snapshot, resolve_boot_id, resolve_last_minutes, sample_filter_sql, validate_time_range
 from .storage import quote_identifier
 
 
@@ -289,6 +289,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--format", choices=("csv", "jsonl"), default="csv", help="format de sortie (défaut : csv)")
     parser.add_argument("--events", action="store_true", help="exporter la table events au lieu de samples")
     parser.add_argument("--boot", dest="boot_id", help="limiter les mesures à un boot_id")
+    parser.add_argument("--latest-boot", action="store_true", help="limiter au boot le plus récent")
     parser.add_argument("--since", type=int, help="epoch ms inclusif")
     parser.add_argument("--until", type=int, help="epoch ms exclusif")
     parser.add_argument("--last-minutes", type=float, help="limiter aux N dernières minutes")
@@ -300,13 +301,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--severity", help="filtrer les événements par gravité (avec --events)")
     args = parser.parse_args(argv)
     if args.events and (
-        args.boot_id is not None or args.columns is not None
+        args.boot_id is not None or args.latest_boot or args.columns is not None
         or args.exclude_columns is not None or args.bucket_ms is not None
     ):
-        parser.error("--boot, --columns, --exclude-columns et --bucket-ms ne s'appliquent pas à --events")
+        parser.error("--boot, --latest-boot, --columns, --exclude-columns et --bucket-ms ne s'appliquent pas à --events")
     if not args.events and any(v is not None for v in (args.source, args.kind, args.severity)):
         parser.error("--source, --kind et --severity nécessitent --events")
     try:
+        boot_id = None if args.events else resolve_boot_id(args.db, boot_id=args.boot_id, latest_boot=args.latest_boot)
         since, until = resolve_last_minutes(args.last_minutes, args.since, args.until)
         with _output(args.output) as target:
             if args.events:
@@ -317,17 +319,17 @@ def main(argv: Sequence[str] | None = None) -> None:
             elif args.bucket_ms is not None:
                 count = export_downsampled(
                     args.db, target, bucket_ms=args.bucket_ms, fmt=args.format,
-                    boot_id=args.boot_id, since=since, until=until,
+                    boot_id=boot_id, since=since, until=until,
                     columns=args.columns, exclude_columns=args.exclude_columns,
                 )
             elif args.format == "jsonl":
                 count = export_jsonl(
-                    args.db, target, boot_id=args.boot_id, since=since,
+                    args.db, target, boot_id=boot_id, since=since,
                     until=until, columns=args.columns, exclude_columns=args.exclude_columns,
                 )
             else:
                 count = export_csv(
-                    args.db, target, boot_id=args.boot_id, since=since,
+                    args.db, target, boot_id=boot_id, since=since,
                     until=until, columns=args.columns, exclude_columns=args.exclude_columns,
                 )
             target.flush()

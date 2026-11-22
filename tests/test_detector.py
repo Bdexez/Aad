@@ -281,6 +281,19 @@ class BaselineDetectorTest(unittest.TestCase):
         self.assertEqual(tuned["best"]["threshold"], 4.0)
         self.assertAlmostEqual(tuned["best"]["f1"], 1.0)
 
+        out_file = self.db.with_name("episodes.json")
+        detector_module.main([
+            "--db", str(self.db), "--load-model", str(model_path),
+            "--since", "10000", "--json", "--output", str(out_file),
+        ])
+        self.assertEqual(len(json.loads(out_file.read_text(encoding="utf-8"))["episodes"]), 1)
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exc:
+            detector_module.main([
+                "--db", str(self.db), "--load-model", str(model_path),
+                "--since", "10000", "--json", "--output", str(out_file),
+            ])
+        self.assertEqual(exc.exception.code, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

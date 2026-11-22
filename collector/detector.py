@@ -18,6 +18,7 @@ import sqlite3
 
 from .analyze import _MAD_SCALE, _numeric_metrics, _quantile
 from .database import read_snapshot, sample_filter_sql, validate_time_range
+from .export import _output
 from .storage import quote_identifier
 
 
@@ -817,6 +818,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="calibrer le seuil optimal (F1) sur --eval-label")
     parser.add_argument("--thresholds", nargs="+", type=float,
                         help="grille de seuils personnalisée pour --tune-threshold")
+    parser.add_argument("--output", default="-",
+                        help="nouveau fichier de sortie, ou - pour stdout (défaut)")
     parser.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
     args = parser.parse_args(argv)
 
@@ -874,51 +877,63 @@ def main(argv: Sequence[str] | None = None) -> None:
     except (ValueError, OSError, sqlite3.Error) as exc:
         parser.error(str(exc))
 
-    if args.json:
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        return
+    def emit_output(stream) -> None:
+        if args.json:
+            stream.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+            return
 
-    if args.tune_threshold:
-        fmt = lambda v: "n/a" if v is None else f"{v:.3f}"
-        best = result["best"]
-        print(
-            f"Calibration ({result['eval_label']}, {result['samples']} mesures) — "
-            f"meilleur seuil : z >= {best['threshold']} (f1={fmt(best['f1'])}, "
-            f"precision={fmt(best['precision'])}, recall={fmt(best['recall'])})"
-        )
-        for row in result["grid"]:
+        if args.tune_threshold:
+            fmt = lambda v: "n/a" if v is None else f"{v:.3f}"
+            best = result["best"]
             print(
-                f"  z >= {row['threshold']:4.1f} : episodes={row['episodes']}, "
-                f"precision={fmt(row['precision'])}, recall={fmt(row['recall'])}, f1={fmt(row['f1'])}"
+                f"Calibration ({result['eval_label']}, {result['samples']} mesures) — "
+                f"meilleur seuil : z >= {best['threshold']} (f1={fmt(best['f1'])}, "
+                f"precision={fmt(best['precision'])}, recall={fmt(best['recall'])})",
+                file=stream,
             )
-        return
+            for row in result["grid"]:
+                print(
+                    f"  z >= {row['threshold']:4.1f} : episodes={row['episodes']}, "
+                    f"precision={fmt(row['precision'])}, recall={fmt(row['recall'])}, f1={fmt(row['f1'])}",
+                    file=stream,
+                )
+            return
 
-    base = result["baseline"]
-    tgt = result["target"]
-    pct = "indéfinie" if tgt["anomalous_pct"] is None else f"{tgt['anomalous_pct']:.1f} %"
-    print(f"Référence : {base['samples']} mesures, {base['features_used']} métrique(s) active(s)")
-    print(f"Cible     : {tgt['samples']} mesures, {tgt['anomalous_samples']} anormale(s) ({pct})")
-    print(f"Épisodes  : {len(result['episodes'])} (seuil z >= {result['threshold']}, min {result['min_samples']} mesures)")
-    for idx, ep in enumerate(result["episodes"], 1):
-        contribs = ", ".join(
-            f"{c['column']} (z={c['peak_z']:+.1f}, val={c['observed_at_peak']:.2f} vs {c['baseline_center']:.2f})"
-            for c in ep["top_contributors"]
-        )
-        print(
-            f"  #{idx} boot={ep['boot_id']} [{ep['ts_start']}..{ep['ts_end']}] "
-            f"n={ep['sample_count']} pic={ep['peak_score']:.1f} — {contribs}"
-        )
-        if ep["events"]:
-            kinds = ", ".join(sorted({f"{e['source']}/{e['kind']}" for e in ep["events"]}))
-            print(f"       événements proches ({len(ep['events'])}) : {kinds}")
-    if "evaluation" in result:
-        ev = result["evaluation"]
-        fmt = lambda v: "n/a" if v is None else f"{v:.3f}"
-        print(
-            f"Évaluation ({ev['label']}) : precision={fmt(ev['precision'])}, "
-            f"recall={fmt(ev['recall'])}, f1={fmt(ev['f1'])} "
-            f"(tp={ev['tp']} fp={ev['fp']} fn={ev['fn']} tn={ev['tn']})"
-        )
+        base = result["baseline"]
+        tgt = result["target"]
+        pct = "indéfinie" if tgt["anomalous_pct"] is None else f"{tgt['anomalous_pct']:.1f} %"
+        print(f"Référence : {base['samples']} mesures, {base['features_used']} métrique(s) active(s)", file=stream)
+        print(f"Cible     : {tgt['samples']} mesures, {tgt['anomalous_samples']} anormale(s) ({pct})", file=stream)
+        print(f"Épisodes  : {len(result['episodes'])} (seuil z >= {result['threshold']}, min {result['min_samples']} mesures)", file=stream)
+        for idx, ep in enumerate(result["episodes"], 1):
+            contribs = ", ".join(
+                f"{c['column']} (z={c['peak_z']:+.1f}, val={c['observed_at_peak']:.2f} vs {c['baseline_center']:.2f})"
+                for c in ep["top_contributors"]
+            )
+            print(
+                f"  #{idx} boot={ep['boot_id']} [{ep['ts_start']}..{ep['ts_end']}] "
+                f"n={ep['sample_count']} pic={ep['peak_score']:.1f} — {contribs}",
+                file=stream,
+            )
+            if ep["events"]:
+                kinds = ", ".join(sorted({f"{e['source']}/{e['kind']}" for e in ep["events"]}))
+                print(f"       événements proches ({len(ep['events'])}) : {kinds}", file=stream)
+        if "evaluation" in result:
+            ev = result["evaluation"]
+            fmt = lambda v: "n/a" if v is None else f"{v:.3f}"
+            print(
+                f"Évaluation ({ev['label']}) : precision={fmt(ev['precision'])}, "
+                f"recall={fmt(ev['recall'])}, f1={fmt(ev['f1'])} "
+                f"(tp={ev['tp']} fp={ev['fp']} fn={ev['fn']} tn={ev['tn']})",
+                file=stream,
+            )
+
+    try:
+        with _output(args.output) as stream:
+            emit_output(stream)
+            stream.flush()
+    except OSError as exc:
+        parser.error(f"écriture impossible: {exc}")
 
 
 if __name__ == "__main__":

@@ -225,6 +225,14 @@ def _fit_baseline(
     return total, fitted, skipped
 
 
+def _directional_mag(z: float, direction: str) -> float:
+    if direction == "high":
+        return z if z > 0.0 else 0.0
+    if direction == "low":
+        return -z if z < 0.0 else 0.0
+    return abs(z)
+
+
 def _f1_metrics(tp: int, fp: int, fn: int, tn: int) -> dict:
     precision = tp / (tp + fp) if (tp + fp) else None
     recall = tp / (tp + fn) if (tp + fn) else None
@@ -296,6 +304,7 @@ def detect_anomalies(
     control_for: str | None = None,
     group_by: str | None = None,
     score_mode: str = "max",
+    direction: str = "both",
     smooth: int = 1,
     threshold: float = 4.0,
     min_samples: int = 3,
@@ -304,14 +313,20 @@ def detect_anomalies(
     load_model: str | pathlib.Path | None = None,
     save_model: str | pathlib.Path | None = None,
     export_scores: str | pathlib.Path | None = None,
+    export_labels: str | pathlib.Path | None = None,
+    label_name: str = "candidate_anomaly",
 ) -> dict:
     """Ajuste ou charge une référence robuste et détecte les épisodes anormaux."""
     if columns is not None and exclude_columns is not None:
         raise ValueError("--columns et --exclude-columns sont mutuellement exclusifs")
     if score_mode not in ("max", "rms"):
         raise ValueError("--score-mode doit valoir 'max' ou 'rms'")
+    if direction not in ("both", "high", "low"):
+        raise ValueError("--direction doit valoir 'both', 'high' ou 'low'")
     if smooth < 1:
         raise ValueError("--smooth doit être >= 1")
+    if export_labels is not None and not label_name.strip():
+        raise ValueError("--label-name ne peut pas être vide")
     if not math.isfinite(threshold) or threshold <= 0:
         raise ValueError("--threshold doit être un nombre fini > 0")
     if min_samples < 1:
@@ -554,11 +569,11 @@ def detect_anomalies(
                     else:
                         expected = fb.center
                     z = (val - expected) / fb.scale
-                    az = abs(z)
+                    az = _directional_mag(z, direction)
                     if az > max_abs:
                         max_abs = az
                         top_sensor = fb.column
-                    sq_sum += z * z
+                    sq_sum += az * az
                     n_obs += 1
                     z_obs.append((fb, z, val, expected))
 
@@ -597,7 +612,7 @@ def detect_anomalies(
                     if is_pos:
                         run_eval_pos += 1
                     for fb, z, val, expected in z_obs:
-                        az = abs(z)
+                        az = _directional_mag(z, direction)
                         prev = run_contrib.get(fb.column)
                         if prev is None or az > prev[0]:
                             run_contrib[fb.column] = (az, z, val, expected)
@@ -670,6 +685,30 @@ def detect_anomalies(
                 "episode_f1": ep_f1,
             }
 
+    if export_labels is not None:
+        lbl_path = pathlib.Path(export_labels)
+        clean_name = label_name.strip()
+        candidates = [
+            {
+                "ts_start": ep["ts_start"],
+                "ts_end": ep["ts_end"] + 1,
+                "label": clean_name,
+                "notes": (
+                    f"peak={ep['peak_score']:.2f}, n={ep['sample_count']}, "
+                    + ", ".join(f"{c['column']}(z={c['peak_z']:+.1f})" for c in ep["top_contributors"])
+                ),
+            }
+            for ep in episodes
+        ]
+        stream = lbl_path.open("x", encoding="utf-8")
+        try:
+            with stream:
+                json.dump(candidates, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+        except BaseException:
+            lbl_path.unlink(missing_ok=True)
+            raise
+
     result = {
         "baseline": baseline_meta,
         "target": {
@@ -681,6 +720,7 @@ def detect_anomalies(
             "anomalous_pct": (anomalous_samples / total_scored * 100.0) if total_scored else None,
         },
         "score_mode": score_mode,
+        "direction": direction,
         "smooth": smooth,
         "threshold": threshold,
         "min_samples": min_samples,
@@ -1110,6 +1150,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--group-by", help="colonne de régime discret (ex. is_gaming) pour ajuster un profil par régime")
     parser.add_argument("--score-mode", choices=("max", "rms"), default="max",
                         help="agrégation du score par tick : max |z| (défaut) ou rms multivarié")
+    parser.add_argument("--direction", choices=("both", "high", "low"), default="both",
+                        help="direction des dérives scorées : both (défaut), high (z>0) ou low (z<0)")
     parser.add_argument("--smooth", type=int, default=1,
                         help="lissage par moyenne mobile sur N ticks du score (défaut : 1)")
     parser.add_argument("--threshold", type=float, default=4.0,
@@ -1124,6 +1166,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="exporter les scores d'anomalie par échantillon en CSV")
     parser.add_argument("--export-curve", type=pathlib.Path,
                         help="exporter la courbe ROC/PR par seuil en CSV (avec --tune-threshold)")
+    parser.add_argument("--export-labels", type=pathlib.Path,
+                        help="exporter les épisodes détectés en JSON compatible `label import`")
+    parser.add_argument("--label-name", default="candidate_anomaly",
+                        help="nom de label pour --export-labels (défaut : candidate_anomaly)")
     parser.add_argument("--tune-threshold", action="store_true",
                         help="calibrer le seuil optimal (F1) sur --eval-label")
     parser.add_argument("--benchmark", action="store_true",
@@ -1226,6 +1272,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 control_for=args.control_for,
                 group_by=args.group_by,
                 score_mode=args.score_mode,
+                direction=args.direction,
                 smooth=args.smooth,
                 threshold=args.threshold,
                 min_samples=args.min_samples,
@@ -1233,6 +1280,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 load_model=args.load_model,
                 save_model=args.save_model,
                 export_scores=args.export_scores,
+                export_labels=args.export_labels,
+                label_name=args.label_name,
             )
     except (ValueError, OSError, sqlite3.Error) as exc:
         parser.error(str(exc))

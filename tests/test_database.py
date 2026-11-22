@@ -5,7 +5,7 @@ import sqlite3
 import tempfile
 import unittest
 
-from collector.database import read_snapshot, resolve_last_minutes, sample_filter_sql, validate_time_range
+from collector.database import read_snapshot, resolve_boot_id, resolve_last_minutes, sample_filter_sql, validate_time_range
 from collector.main import SCHEMA
 from collector.storage import Storage
 
@@ -62,3 +62,13 @@ class ReadSnapshotTest(unittest.TestCase):
             resolve_last_minutes(5.0, 100, None)
         with self.assertRaises(ValueError):
             resolve_last_minutes(0.0, None, None)
+
+    def test_resolve_boot_id_picks_most_recent_boot_and_rejects_conflict(self):
+        self.storage.insert_samples([
+            {"ts": 100, "boot_id": "old"},
+            {"ts": 500, "boot_id": "newest"},
+            {"ts": 300, "boot_id": "mid"},
+        ])
+        self.assertEqual(resolve_boot_id(self.db, latest_boot=True), "newest")
+        with self.assertRaises(ValueError):
+            resolve_boot_id(self.db, boot_id="old", latest_boot=True)

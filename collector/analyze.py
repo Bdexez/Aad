@@ -16,7 +16,7 @@ import pathlib
 import re
 import sqlite3
 
-from .database import read_snapshot, resolve_last_minutes, sample_filter_sql, validate_time_range
+from .database import read_snapshot, resolve_boot_id, resolve_last_minutes, sample_filter_sql, validate_time_range
 from .storage import quote_identifier
 
 _META_COLUMNS = frozenset({"sample_id", "ts", "boot_id"})
@@ -1668,6 +1668,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Analyse exploratoire du dataset AAD")
     parser.add_argument("--db", default="data/metrics.db", help="base SQLite existante")
     parser.add_argument("--boot", dest="boot_id", help="limiter les mesures à un boot_id")
+    parser.add_argument("--latest-boot", action="store_true", help="limiter au boot le plus récent")
     parser.add_argument("--since", type=int, help="epoch ms inclusif")
     parser.add_argument("--until", type=int, help="epoch ms exclusif")
     parser.add_argument("--last-minutes", type=float, help="limiter aux N dernières minutes")
@@ -1743,76 +1744,77 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--markdown s'applique uniquement au mode exploratoire par défaut")
 
     try:
+        boot_id = resolve_boot_id(args.db, boot_id=args.boot_id, latest_boot=args.latest_boot)
         since, until = resolve_last_minutes(args.last_minutes, args.since, args.until)
         if args.compare:
             result = compare_labels(
                 args.db, args.compare[0], args.compare[1],
-                boot_id=args.boot_id, since=since, until=until,
+                boot_id=boot_id, since=since, until=until,
             )
         elif args.correlate:
             result = correlate_metric(
                 args.db, args.correlate,
-                boot_id=args.boot_id, since=since, until=until,
+                boot_id=boot_id, since=since, until=until,
                 min_pairs=args.min_pairs,
             )
         elif args.outliers:
             result = detect_outliers(
-                args.db, boot_id=args.boot_id, since=since, until=until,
+                args.db, boot_id=boot_id, since=since, until=until,
                 z_threshold=args.z_threshold, columns=args.columns,
             )
         elif args.check_labels:
             result = audit_labels(
-                args.db, boot_id=args.boot_id, since=since, until=until,
+                args.db, boot_id=boot_id, since=since, until=until,
             )
         elif args.drift:
             result = analyze_drift(
-                args.db, boot_id=args.boot_id, since=since, until=until,
+                args.db, boot_id=boot_id, since=since, until=until,
                 slices=args.slices,
             )
         elif args.by:
             result = analyze_by_group(
-                args.db, args.by, boot_id=args.boot_id, since=since,
+                args.db, args.by, boot_id=boot_id, since=since,
                 until=until, columns=args.columns,
             )
         elif args.check_bounds:
             result = check_physical_bounds(
-                args.db, boot_id=args.boot_id, since=since, until=until,
+                args.db, boot_id=boot_id, since=since, until=until,
             )
         elif args.stuck_runs:
             result = detect_stuck_runs(
-                args.db, boot_id=args.boot_id, since=since, until=until,
+                args.db, boot_id=boot_id, since=since, until=until,
                 min_run=args.min_run, columns=args.columns,
             )
         elif args.changepoints:
             result = detect_changepoints(
-                args.db, args.changepoints, boot_id=args.boot_id, since=since, until=until,
+                args.db, args.changepoints, boot_id=boot_id, since=since, until=until,
                 window=args.window, threshold=args.cp_threshold,
             )
         elif args.collinear:
             result = detect_collinearity(
-                args.db, boot_id=args.boot_id, since=since, until=until,
+                args.db, boot_id=boot_id, since=since, until=until,
                 r_threshold=args.r_threshold, min_pairs=args.min_pairs, columns=args.columns,
             )
         elif args.missing_blocks:
             result = detect_missing_blocks(
-                args.db, boot_id=args.boot_id, since=since, until=until,
+                args.db, boot_id=boot_id, since=since, until=until,
                 min_run=args.min_missing, columns=args.columns,
             )
         elif args.lag_correlate:
             result = lag_correlate(
                 args.db, args.lag_correlate[0], args.lag_correlate[1],
-                boot_id=args.boot_id, since=since, until=until,
+                boot_id=boot_id, since=since, until=until,
                 max_lag=args.max_lag, min_pairs=args.min_pairs,
             )
         elif args.clipping:
             result = detect_clipping(
-                args.db, boot_id=args.boot_id, since=since, until=until,
+                args.db, boot_id=boot_id, since=since, until=until,
                 min_pct=args.clip_pct, columns=args.columns,
             )
         elif args.thermal_profile:
             result = thermal_profile(
                 args.db, args.thermal_profile[0], args.thermal_profile[1],
-                boot_id=args.boot_id, since=since, until=until, min_pairs=args.min_pairs,
+                boot_id=boot_id, since=since, until=until, min_pairs=args.min_pairs,
             )
         elif args.compare_boots:
             result = compare_boots(
@@ -1822,11 +1824,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         elif args.event_impact:
             result = event_impact(
                 args.db, args.event_impact, window_ms=args.impact_window_ms,
-                boot_id=args.boot_id, since=since, until=until,
+                boot_id=boot_id, since=since, until=until,
             )
         else:
             result = analyze_dataset(
-                args.db, boot_id=args.boot_id, since=since,
+                args.db, boot_id=boot_id, since=since,
                 until=until, gap_factor=args.gap_factor,
             )
     except (ValueError, OSError, sqlite3.Error) as exc:

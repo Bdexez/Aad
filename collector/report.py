@@ -8,7 +8,7 @@ import json
 import pathlib
 import sqlite3
 
-from .database import read_snapshot, resolve_last_minutes, sample_filter_sql, validate_time_range
+from .database import read_snapshot, resolve_boot_id, resolve_last_minutes, sample_filter_sql, validate_time_range
 from .storage import quote_identifier
 
 
@@ -104,21 +104,23 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--db", default="data/metrics.db", help="base SQLite existante")
     parser.add_argument("--json", action="store_true", help="rapport JSON pour les scripts")
     parser.add_argument("--boot", dest="boot_id", help="limiter les mesures à un boot_id")
+    parser.add_argument("--latest-boot", action="store_true", help="limiter au boot le plus récent")
     parser.add_argument("--since", type=int, help="epoch ms inclusif")
     parser.add_argument("--until", type=int, help="epoch ms exclusif")
     parser.add_argument("--last-minutes", type=float, help="limiter aux N dernières minutes")
     args = parser.parse_args(argv)
     try:
+        boot_id = resolve_boot_id(args.db, boot_id=args.boot_id, latest_boot=args.latest_boot)
         since, until = resolve_last_minutes(args.last_minutes, args.since, args.until)
-        report = dataset_report(args.db, boot_id=args.boot_id, since=since, until=until)
+        report = dataset_report(args.db, boot_id=boot_id, since=since, until=until)
     except (ValueError, OSError, sqlite3.Error) as exc:
         parser.error(str(exc))
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return
     samples = report["samples"]
-    if args.boot_id is not None:
-        print(f"Boot : {args.boot_id}")
+    if boot_id is not None:
+        print(f"Boot : {boot_id}")
     if since is not None or until is not None:
         start = "sans borne" if since is None else str(since)
         end = "sans borne" if until is None else str(until)

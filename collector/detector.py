@@ -19,7 +19,7 @@ import pathlib
 import sqlite3
 
 from .analyze import _MAD_SCALE, _numeric_metrics, _quantile
-from .database import read_snapshot, resolve_last_minutes, sample_filter_sql, validate_time_range
+from .database import read_snapshot, resolve_boot_id, resolve_last_minutes, sample_filter_sql, validate_time_range
 from .export import _output
 from .storage import quote_identifier
 
@@ -1098,6 +1098,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--baseline-since", type=int, help="début référence (epoch ms inclusif)")
     parser.add_argument("--baseline-until", type=int, help="fin référence (epoch ms exclusif)")
     parser.add_argument("--boot", dest="boot_id", help="limiter la cible à un boot_id")
+    parser.add_argument("--latest-boot", action="store_true", help="limiter la cible au boot le plus récent")
     parser.add_argument("--since", type=int, help="début cible (epoch ms inclusif)")
     parser.add_argument("--until", type=int, help="fin cible (epoch ms exclusif)")
     parser.add_argument("--last-minutes", type=float, help="limiter la cible aux N dernières minutes")
@@ -1156,11 +1157,16 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     try:
         since, until = resolve_last_minutes(args.last_minutes, args.since, args.until)
+        boot_id = (
+            None
+            if args.inspect_model
+            else resolve_boot_id(args.db, boot_id=args.boot_id, latest_boot=args.latest_boot)
+        )
         if args.inspect_model:
             result = inspect_model(args.load_model)
         elif args.check_model:
             result = check_model_compatibility(
-                args.db, args.load_model, boot_id=args.boot_id, since=since, until=until,
+                args.db, args.load_model, boot_id=boot_id, since=since, until=until,
             )
         elif args.benchmark:
             result = benchmark_configs(
@@ -1170,7 +1176,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 baseline_boot=args.baseline_boot,
                 baseline_since=args.baseline_since,
                 baseline_until=args.baseline_until,
-                boot_id=args.boot_id,
+                boot_id=boot_id,
                 since=since,
                 until=until,
                 target_label=args.target_label,
@@ -1189,7 +1195,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 baseline_boot=args.baseline_boot,
                 baseline_since=args.baseline_since,
                 baseline_until=args.baseline_until,
-                boot_id=args.boot_id,
+                boot_id=boot_id,
                 since=since,
                 until=until,
                 target_label=args.target_label,
@@ -1210,7 +1216,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 baseline_boot=args.baseline_boot,
                 baseline_since=args.baseline_since,
                 baseline_until=args.baseline_until,
-                boot_id=args.boot_id,
+                boot_id=boot_id,
                 since=since,
                 until=until,
                 target_label=args.target_label,

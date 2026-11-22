@@ -761,6 +761,7 @@ def tune_threshold(
     control_for: str | None = None,
     group_by: str | None = None,
     score_mode: str = "max",
+    smooth: int = 1,
     thresholds: Sequence[float] | None = None,
     min_samples: int = 3,
     load_model: str | pathlib.Path | None = None,
@@ -769,6 +770,8 @@ def tune_threshold(
     """Évalue une grille de seuils z en une passe et sélectionne le meilleur F1."""
     if score_mode not in ("max", "rms"):
         raise ValueError("--score-mode doit valoir 'max' ou 'rms'")
+    if smooth < 1:
+        raise ValueError("--smooth doit être >= 1")
     eval_label = eval_label.strip()
     if not eval_label:
         raise ValueError("--eval-label ne peut pas être vide")
@@ -853,8 +856,13 @@ def tune_threshold(
         has_control = control_for is not None
         has_group = group_by is not None
         scored: list[tuple[str, float | None, bool]] = []
+        smooth_window: deque[float] = deque(maxlen=smooth)
+        last_boot: str | None = None
         for row in cursor:
             boot = row[0]
+            if boot != last_boot:
+                smooth_window.clear()
+                last_boot = boot
             values = row[1 : 1 + n_feat]
             idx = 1 + n_feat
             ctrl_val = row[idx] if has_control else None
@@ -884,7 +892,12 @@ def tune_threshold(
                     max_abs = az
                 sq_sum += z * z
                 n_obs += 1
-            sample_score = (math.sqrt(sq_sum / n_obs) if score_mode == "rms" else max_abs) if n_obs > 0 else None
+            if n_obs > 0:
+                raw_score = math.sqrt(sq_sum / n_obs) if score_mode == "rms" else max_abs
+                smooth_window.append(raw_score)
+                sample_score: float | None = sum(smooth_window) / len(smooth_window)
+            else:
+                sample_score = None
             scored.append((boot, sample_score, is_pos))
 
     results = [_evaluate_scores_at_threshold(scored, t, min_samples) for t in sorted(set(grid))]
@@ -941,6 +954,7 @@ def benchmark_configs(
     columns: Sequence[str] | None = None,
     control_for: str | None = None,
     group_by: str | None = None,
+    smooth: int = 1,
     thresholds: Sequence[float] | None = None,
     min_samples: int = 3,
 ) -> dict:
@@ -971,6 +985,7 @@ def benchmark_configs(
                 control_for=ctrl,
                 group_by=grp,
                 score_mode=mode,
+                smooth=smooth,
                 thresholds=thresholds,
                 min_samples=min_samples,
             )
@@ -1162,6 +1177,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 columns=args.columns,
                 control_for=args.control_for,
                 group_by=args.group_by,
+                smooth=args.smooth,
                 thresholds=args.thresholds,
                 min_samples=args.min_samples,
             )
@@ -1181,6 +1197,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 control_for=args.control_for,
                 group_by=args.group_by,
                 score_mode=args.score_mode,
+                smooth=args.smooth,
                 thresholds=args.thresholds,
                 min_samples=args.min_samples,
                 load_model=args.load_model,

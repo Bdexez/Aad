@@ -25,6 +25,7 @@ from collector.analyze import (
     detect_missing_blocks,
     detect_outliers,
     detect_stuck_runs,
+    event_impact,
     lag_correlate,
     thermal_profile,
 )
@@ -512,6 +513,26 @@ class AnalyzeDatasetTest(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as out:
             analyze_module.main(["--db", str(self.db), "--compare-boots", "clean", "clogged"])
         self.assertIn("Comparaison boots : clean", out.getvalue())
+
+    def test_event_impact_compares_pre_and_post_event_windows(self):
+        self.storage.insert_samples([
+            {"ts": 1000, "boot_id": "a", "temp_c": 88.0},
+            {"ts": 2000, "boot_id": "a", "temp_c": 90.0},
+            {"ts": 3000, "boot_id": "a", "temp_c": 92.0},
+            {"ts": 5000, "boot_id": "a", "temp_c": 70.0},
+            {"ts": 6000, "boot_id": "a", "temp_c": 68.0},
+        ])
+        self.storage.add_event(5000, "kmsg", "thermal_trip", "critical", "throttled")
+        res = event_impact(self.db, "thermal_trip", window_ms=5000)
+        self.assertEqual(res["events_found"], 1)
+        self.assertEqual(res["before_samples"], 3)
+        self.assertEqual(res["after_samples"], 2)
+        self.assertEqual(res["metrics"][0]["column"], "temp_c")
+        self.assertAlmostEqual(res["metrics"][0]["delta_mean"], -21.0)
+
+        with redirect_stdout(io.StringIO()) as out:
+            analyze_module.main(["--db", str(self.db), "--event-impact", "thermal_trip", "--impact-window-ms", "5000"])
+        self.assertIn("Impact de thermal_trip", out.getvalue())
 
 
 if __name__ == "__main__":

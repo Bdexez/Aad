@@ -127,3 +127,22 @@ class LabelsTest(unittest.TestCase):
             with self.subTest(cmd=cmd), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as err:
                 label_module.main(["--db", str(self.db), *cmd])
             self.assertEqual(err.exception.code, 2)
+
+    def test_export_and_idempotent_import_roundtrip(self):
+        first = self.storage.start_label(100, "normal", "baseline")
+        self.storage.end_label(200, first)
+        self.storage.start_label(300, "airflow_blocked", "en cours")
+
+        exported = self.db.with_name("labels.json")
+        label_module.main(["--db", str(self.db), "export", "--output", str(exported)])
+        self.assertEqual(len(json.loads(exported.read_text(encoding="utf-8"))), 2)
+
+        other_db = self.db.with_name("other.db")
+        with redirect_stdout(io.StringIO()) as out:
+            label_module.main(["--db", str(other_db), "import", str(exported)])
+        self.assertIn("2 label(s) importé(s), 0 doublon(s)", out.getvalue())
+
+        # Ré-import idempotent
+        with redirect_stdout(io.StringIO()) as out:
+            label_module.main(["--db", str(other_db), "import", str(exported)])
+        self.assertIn("0 label(s) importé(s), 2 doublon(s)", out.getvalue())

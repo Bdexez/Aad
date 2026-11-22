@@ -293,6 +293,58 @@ class Storage:
         cur = self.conn.execute("DELETE FROM labels WHERE id = ?", (label_id,))
         return cur.rowcount > 0
 
+    def import_labels(self, entries: list[dict]) -> tuple[int, int]:
+        """Importe une liste de fenêtres de labels de façon atomique et idempotente.
+
+        Ignore les doublons exacts sur `(ts_start, ts_end, label)`. Retourne
+        `(insérés, ignorés)`.
+        """
+        validated: list[tuple[int, int | None, str, str]] = []
+        for idx, item in enumerate(entries):
+            if not isinstance(item, dict):
+                raise ValueError(f"entrée #{idx} invalide: objet JSON attendu")
+            ts_start = item.get("ts_start")
+            ts_end = item.get("ts_end")
+            raw_label = item.get("label")
+            notes = item.get("notes", "")
+            if type(ts_start) is not int:
+                raise ValueError(f"entrée #{idx}: ts_start entier requis")
+            if ts_end is not None and (type(ts_end) is not int or ts_end < ts_start):
+                raise ValueError(f"entrée #{idx}: ts_end doit être None ou entier >= ts_start")
+            if not isinstance(raw_label, str) or not raw_label.strip():
+                raise ValueError(f"entrée #{idx}: label vide ou invalide")
+            if notes is None:
+                notes = ""
+            if not isinstance(notes, str):
+                raise ValueError(f"entrée #{idx}: notes doit être une chaîne")
+            validated.append((ts_start, ts_end, raw_label.strip(), notes))
+
+        inserted = 0
+        skipped = 0
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = {
+                (r[0], r[1], r[2])
+                for r in self.conn.execute("SELECT ts_start, ts_end, label FROM labels")
+            }
+            for ts_start, ts_end, label, notes in validated:
+                key = (ts_start, ts_end, label)
+                if key in existing:
+                    skipped += 1
+                    continue
+                self.conn.execute(
+                    "INSERT INTO labels (ts_start, ts_end, label, notes) VALUES (?, ?, ?, ?)",
+                    (ts_start, ts_end, label, notes),
+                )
+                existing.add(key)
+                inserted += 1
+            self.conn.execute("COMMIT")
+        except BaseException:
+            if self.conn.in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise
+        return inserted, skipped
+
     def count_samples(self) -> int:
         return int(self.conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0])
 

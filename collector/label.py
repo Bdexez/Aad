@@ -21,6 +21,7 @@ import json
 import pathlib
 import sqlite3
 
+from .export import _output
 from .main import SCHEMA, now_ms
 from .storage import Storage
 
@@ -68,12 +69,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     delete = sub.add_parser("delete", help="supprimer une fenêtre créée par erreur")
     delete.add_argument("id", type=int)
 
+    exp = sub.add_parser("export", help="exporter toutes les fenêtres en JSON portable")
+    exp.add_argument("--output", default="-", help="nouveau fichier JSON, ou - pour stdout")
+
+    imp = sub.add_parser("import", help="importer des fenêtres depuis un fichier JSON (idempotent)")
+    imp.add_argument("path", type=pathlib.Path)
+
     args = ap.parse_args(argv)
     if args.command == "start":
         args.label = args.label.strip()
         if not args.label:
             ap.error("le label ne peut pas être vide")
-    else:
+    elif args.command != "import":
         if not pathlib.Path(args.db).is_file():
             ap.error(f"base introuvable: {args.db}")
         if args.command in ("end", "note", "delete") and args.id is not None and args.id <= 0:
@@ -96,6 +103,21 @@ def main(argv: Sequence[str] | None = None) -> None:
                 if not storage.delete_label(args.id):
                     raise ValueError(f"label #{args.id} introuvable")
                 print(f"label #{args.id} supprimé")
+            elif args.command == "export":
+                rows = storage.list_labels(include_closed=True)
+                payload = [
+                    {"ts_start": r[1], "ts_end": r[2], "label": r[3], "notes": r[4]}
+                    for r in rows
+                ]
+                with _output(args.output) as stream:
+                    stream.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+                    stream.flush()
+            elif args.command == "import":
+                entries = json.loads(args.path.read_text(encoding="utf-8"))
+                if not isinstance(entries, list):
+                    raise ValueError("le fichier JSON doit contenir un tableau de fenêtres")
+                inserted, skipped = storage.import_labels(entries)
+                print(f"{inserted} label(s) importé(s), {skipped} doublon(s) ignoré(s)")
             else:
                 rows = storage.list_labels(include_closed=args.all, label=args.label)
                 if args.json:

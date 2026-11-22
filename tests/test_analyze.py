@@ -11,6 +11,7 @@ import unittest
 
 from collector import analyze as analyze_module
 from collector.analyze import (
+    analyze_by_group,
     analyze_dataset,
     analyze_drift,
     audit_labels,
@@ -310,6 +311,28 @@ class AnalyzeDatasetTest(unittest.TestCase):
             analyze_module.main(["--db", str(self.db), "--drift", "--slices", "2"])
         self.assertIn("Dérive temporelle", out.getvalue())
         self.assertIn("temp_c", out.getvalue())
+
+    def test_analyze_by_group_splits_stats_by_context_including_null(self):
+        self.storage.ensure_columns(["is_gaming"])
+        self.storage.insert_samples([
+            {"ts": 1000, "boot_id": "a", "is_gaming": 0.0, "temp_c": 42.0},
+            {"ts": 2000, "boot_id": "a", "is_gaming": 0.0, "temp_c": 44.0},
+            {"ts": 3000, "boot_id": "a", "is_gaming": 1.0, "temp_c": 74.0},
+            {"ts": 4000, "boot_id": "a", "is_gaming": None, "temp_c": 50.0},
+        ])
+        res = analyze_by_group(self.db, "is_gaming", columns=["temp_c"])
+        by_val = {g["value"]: g for g in res["groups"]}
+        self.assertAlmostEqual(by_val[0.0]["metrics"][0]["mean"], 43.0)
+        self.assertAlmostEqual(by_val[1.0]["metrics"][0]["mean"], 74.0)
+        self.assertAlmostEqual(by_val[None]["metrics"][0]["mean"], 50.0)
+
+        with self.assertRaises(ValueError):
+            analyze_by_group(self.db, "ts", max_groups=2)
+
+        with redirect_stdout(io.StringIO()) as out:
+            analyze_module.main(["--db", str(self.db), "--by", "is_gaming", "--columns", "temp_c"])
+        self.assertIn("[0.0]", out.getvalue())
+        self.assertIn("[NULL]", out.getvalue())
 
 
 if __name__ == "__main__":

@@ -23,11 +23,18 @@ def _iter_samples(
     since: int | None,
     until: int | None,
     columns: Sequence[str] | None,
+    exclude_columns: Sequence[str] | None,
     reserved_label_column: str,
 ) -> tuple[list[str], Iterator[tuple[tuple, list[dict]]]]:
+    if columns is not None and exclude_columns is not None:
+        raise ValueError("--columns et --exclude-columns sont mutuellement exclusifs")
     fields = conn.execute("PRAGMA table_info(samples)").fetchall()
     available = [field[1] for field in fields]
-    selected = available if columns is None else list(columns)
+    if columns is None:
+        excluded = set(exclude_columns or ())
+        selected = [c for c in available if c not in excluded]
+    else:
+        selected = list(columns)
     if not selected:
         raise ValueError("aucune colonne de mesures à exporter")
     unknown = set(selected) - set(available)
@@ -81,6 +88,7 @@ def export_csv(
     since: int | None = None,
     until: int | None = None,
     columns: Sequence[str] | None = None,
+    exclude_columns: Sequence[str] | None = None,
 ) -> int:
     """Écrit une ligne par mesure, en flux, depuis un snapshot SQLite cohérent.
 
@@ -92,7 +100,7 @@ def export_csv(
     with read_snapshot(db) as conn:
         selected, rows = _iter_samples(
             conn, boot_id=boot_id, since=since, until=until,
-            columns=columns, reserved_label_column="labels_json",
+            columns=columns, exclude_columns=exclude_columns, reserved_label_column="labels_json",
         )
         writer = csv.writer(target, lineterminator="\n")
         writer.writerow([*selected, "labels_json"])
@@ -111,13 +119,14 @@ def export_jsonl(
     since: int | None = None,
     until: int | None = None,
     columns: Sequence[str] | None = None,
+    exclude_columns: Sequence[str] | None = None,
 ) -> int:
     """Écrit un objet JSON par mesure (JSON Lines), préservant les types natifs."""
     validate_time_range(since, until)
     with read_snapshot(db) as conn:
         selected, rows = _iter_samples(
             conn, boot_id=boot_id, since=since, until=until,
-            columns=columns, reserved_label_column="labels",
+            columns=columns, exclude_columns=exclude_columns, reserved_label_column="labels",
         )
         count = 0
         for values, labels in rows:
@@ -138,12 +147,15 @@ def export_downsampled(
     since: int | None = None,
     until: int | None = None,
     columns: Sequence[str] | None = None,
+    exclude_columns: Sequence[str] | None = None,
 ) -> int:
     """Exporte les moyennes des métriques numériques par fenêtre fixe `bucket_ms`.
 
     L'agrégation reste dans SQLite (`GROUP BY boot_id, bucket_ts`) afin de
     réduire 14 jours à 1 Hz en un fichier léger sans charger la table en RAM.
     """
+    if columns is not None and exclude_columns is not None:
+        raise ValueError("--columns et --exclude-columns sont mutuellement exclusifs")
     if bucket_ms <= 0:
         raise ValueError("--bucket-ms doit être un entier > 0")
     if fmt not in ("csv", "jsonl"):
@@ -158,7 +170,8 @@ def export_downsampled(
             if field[1] not in ("sample_id", "ts", "boot_id") and (field[2] or "").upper() != "TEXT"
         ]
         if columns is None:
-            selected = numeric
+            excluded = set(exclude_columns or ())
+            selected = [c for c in numeric if c not in excluded]
         else:
             selected = list(columns)
             if not selected:
@@ -280,13 +293,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--until", type=int, help="epoch ms exclusif")
     parser.add_argument("--last-minutes", type=float, help="limiter aux N dernières minutes")
     parser.add_argument("--columns", nargs="+", help="colonnes de mesures à exporter, dans l'ordre choisi")
+    parser.add_argument("--exclude-columns", nargs="+", help="colonnes de mesures à exclure de l'export")
     parser.add_argument("--bucket-ms", type=int, help="ré-échantillonner par fenêtres de N ms (moyenne SQLite)")
     parser.add_argument("--source", help="filtrer les événements par source (avec --events)")
     parser.add_argument("--kind", help="filtrer les événements par genre (avec --events)")
     parser.add_argument("--severity", help="filtrer les événements par gravité (avec --events)")
     args = parser.parse_args(argv)
-    if args.events and (args.boot_id is not None or args.columns is not None or args.bucket_ms is not None):
-        parser.error("--boot, --columns et --bucket-ms ne s'appliquent pas à --events")
+    if args.events and (
+        args.boot_id is not None or args.columns is not None
+        or args.exclude_columns is not None or args.bucket_ms is not None
+    ):
+        parser.error("--boot, --columns, --exclude-columns et --bucket-ms ne s'appliquent pas à --events")
     if not args.events and any(v is not None for v in (args.source, args.kind, args.severity)):
         parser.error("--source, --kind et --severity nécessitent --events")
     try:
@@ -301,17 +318,17 @@ def main(argv: Sequence[str] | None = None) -> None:
                 count = export_downsampled(
                     args.db, target, bucket_ms=args.bucket_ms, fmt=args.format,
                     boot_id=args.boot_id, since=since, until=until,
-                    columns=args.columns,
+                    columns=args.columns, exclude_columns=args.exclude_columns,
                 )
             elif args.format == "jsonl":
                 count = export_jsonl(
                     args.db, target, boot_id=args.boot_id, since=since,
-                    until=until, columns=args.columns,
+                    until=until, columns=args.columns, exclude_columns=args.exclude_columns,
                 )
             else:
                 count = export_csv(
                     args.db, target, boot_id=args.boot_id, since=since,
-                    until=until, columns=args.columns,
+                    until=until, columns=args.columns, exclude_columns=args.exclude_columns,
                 )
             target.flush()
     except (ValueError, OSError, sqlite3.Error) as exc:

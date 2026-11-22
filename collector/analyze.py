@@ -848,6 +848,110 @@ def check_physical_bounds(
     }
 
 
+def detect_stuck_runs(
+    db: str | pathlib.Path,
+    *,
+    boot_id: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+    min_run: int = 30,
+    columns: Sequence[str] | None = None,
+) -> dict:
+    """Détecte les séquences consécutives de valeurs identiques (capteur figé).
+
+    Réinitialise le suivi à chaque changement de `boot_id` ou de valeur `NULL`.
+    Utile pour repérer un capteur gelé après une veille ou un blocage de pilote
+    alors que la sonde n'est pas constante sur l'ensemble du dataset.
+    """
+    if min_run < 2:
+        raise ValueError("--min-run doit être >= 2")
+    validate_time_range(since, until)
+    where, params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
+    with read_snapshot(db) as conn:
+        metrics, order_col = _numeric_metrics(conn)
+        numeric_names = [name for name, _ in metrics]
+        if columns is not None:
+            selected = list(columns)
+            if not selected:
+                raise ValueError("aucune colonne sélectionnée")
+            unknown = set(selected) - set(numeric_names)
+            if unknown:
+                raise ValueError(f"métriques numériques introuvables: {', '.join(sorted(unknown))}")
+        else:
+            selected = numeric_names
+
+        findings: list[dict] = []
+        if selected:
+            proj = ", ".join(f"s.{quote_identifier(c)}" for c in selected)
+            cursor = conn.execute(
+                f"SELECT s.boot_id, s.ts, {proj} FROM samples AS s{where}"
+                f" ORDER BY s.boot_id, s.{quote_identifier(order_col)}",
+                params,
+            )
+            # Par colonne : (cur_val, cur_len, cur_start_ts, cur_end_ts)
+            state: list[list] = [[None, 0, None, None] for _ in selected]
+            # Par colonne : [run_count, stuck_samples, longest_len, longest_val, longest_boot, longest_start, longest_end]
+            agg: list[list] = [[0, 0, 0, None, None, None, None] for _ in selected]
+            current_boot: str | None = None
+
+            def flush_col(idx: int, boot_name: str | None) -> None:
+                val, length, start_ts, end_ts = state[idx]
+                if length >= min_run:
+                    a = agg[idx]
+                    a[0] += 1
+                    a[1] += length
+                    if length > a[2]:
+                        a[2] = length
+                        a[3] = val
+                        a[4] = boot_name
+                        a[5] = start_ts
+                        a[6] = end_ts
+                state[idx] = [None, 0, None, None]
+
+            for row in cursor:
+                boot, ts = row[0], row[1]
+                if boot != current_boot:
+                    if current_boot is not None:
+                        for i in range(len(selected)):
+                            flush_col(i, current_boot)
+                    current_boot = boot
+                for i, val in enumerate(row[2:]):
+                    if val is None:
+                        flush_col(i, current_boot)
+                        continue
+                    cur_val, cur_len, cur_start, _ = state[i]
+                    if cur_len > 0 and val == cur_val:
+                        state[i][1] = cur_len + 1
+                        state[i][3] = ts
+                    else:
+                        flush_col(i, current_boot)
+                        state[i] = [val, 1, ts, ts]
+            if current_boot is not None:
+                for i in range(len(selected)):
+                    flush_col(i, current_boot)
+
+            for col, a in zip(selected, agg):
+                if a[0] > 0:
+                    findings.append({
+                        "column": col,
+                        "run_count": a[0],
+                        "stuck_samples": a[1],
+                        "longest_run": a[2],
+                        "longest_value": a[3],
+                        "longest_boot": a[4],
+                        "longest_ts_start": a[5],
+                        "longest_ts_end": a[6],
+                    })
+            findings.sort(key=lambda item: (-item["longest_run"], item["column"]))
+
+    return {
+        "boot_id": boot_id,
+        "window": {"since": since, "until": until},
+        "min_run": min_run,
+        "stuck_metrics": findings,
+    }
+
+
 def _fmt(value: float | None, digits: int = 2) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
 
@@ -866,7 +970,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="seuil de z-score modifié (MAD) pour --outliers (défaut : 3.5)")
     parser.add_argument("--slices", type=int, default=2,
                         help="nombre de tranches temporelles pour --drift (défaut : 2)")
-    parser.add_argument("--columns", nargs="+", help="sous-ensemble de métriques (pour --outliers)")
+    parser.add_argument("--min-run", type=int, default=30,
+                        help="longueur minimale d'une séquence figée pour --stuck-runs (défaut : 30)")
+    parser.add_argument("--columns", nargs="+", help="sous-ensemble de métriques (pour --outliers, --by, --stuck-runs)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--compare", nargs=2, metavar=("BASELINE", "TARGET"),
                       help="comparer les métriques numériques entre deux labels")
@@ -882,6 +988,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                       help="ventiler les statistiques numériques par valeur discrète de contexte")
     mode.add_argument("--check-bounds", action="store_true",
                       help="vérifier les bornes physiques plausibles des sondes connues")
+    mode.add_argument("--stuck-runs", action="store_true",
+                      help="détecter les séquences consécutives de valeurs identiques (capteur figé)")
     parser.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
     args = parser.parse_args(argv)
 
@@ -920,6 +1028,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             result = check_physical_bounds(
                 args.db, boot_id=args.boot_id, since=args.since, until=args.until,
             )
+        elif args.stuck_runs:
+            result = detect_stuck_runs(
+                args.db, boot_id=args.boot_id, since=args.since, until=args.until,
+                min_run=args.min_run, columns=args.columns,
+            )
         else:
             result = analyze_dataset(
                 args.db, boot_id=args.boot_id, since=args.since,
@@ -930,6 +1043,15 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.stuck_runs:
+        print(f"Séquences figées (>= {result['min_run']} mesures identiques consécutives) :")
+        for item in result["stuck_metrics"]:
+            print(
+                f"  {item['column']} : {item['run_count']} séquence(s), "
+                f"max={item['longest_run']} (val={_fmt(item['longest_value'])}, boot={item['longest_boot']})"
+            )
         return
 
     if args.check_bounds:

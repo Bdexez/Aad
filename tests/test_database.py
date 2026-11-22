@@ -5,7 +5,7 @@ import sqlite3
 import tempfile
 import unittest
 
-from collector.database import read_snapshot, sample_filter_sql, validate_time_range
+from collector.database import read_snapshot, resolve_last_minutes, sample_filter_sql, validate_time_range
 from collector.main import SCHEMA
 from collector.storage import Storage
 
@@ -57,3 +57,8 @@ class ReadSnapshotTest(unittest.TestCase):
             sample_filter_sql(boot_id="b", since=10, until=20, alias="s"),
             (" WHERE s.boot_id = ? AND s.ts >= ? AND s.ts < ?", ["b", 10, 20]),
         )
+        self.assertEqual(resolve_last_minutes(5.0, None, None, now_ms_fn=lambda: 1_000_000), (700_000, None))
+        with self.assertRaises(ValueError):
+            resolve_last_minutes(5.0, 100, None)
+        with self.assertRaises(ValueError):
+            resolve_last_minutes(0.0, None, None)

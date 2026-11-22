@@ -17,7 +17,7 @@ import pathlib
 import sqlite3
 
 from .analyze import _MAD_SCALE, _numeric_metrics, _quantile
-from .database import read_snapshot, sample_filter_sql, validate_time_range
+from .database import read_snapshot, resolve_last_minutes, sample_filter_sql, validate_time_range
 from .export import _output
 from .storage import quote_identifier
 
@@ -801,6 +801,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--boot", dest="boot_id", help="limiter la cible à un boot_id")
     parser.add_argument("--since", type=int, help="début cible (epoch ms inclusif)")
     parser.add_argument("--until", type=int, help="fin cible (epoch ms exclusif)")
+    parser.add_argument("--last-minutes", type=float, help="limiter la cible aux N dernières minutes")
     parser.add_argument("--target-label", help="limiter la cible à un label")
     parser.add_argument("--eval-label", help="évaluer précision/rappel/F1 face à un label terrain")
     parser.add_argument("--columns", nargs="+", help="sous-ensemble de métriques numériques")
@@ -834,6 +835,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--tune-threshold nécessite --eval-label")
 
     try:
+        since, until = resolve_last_minutes(args.last_minutes, args.since, args.until)
         if args.tune_threshold:
             result = tune_threshold(
                 args.db,
@@ -843,8 +845,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 baseline_since=args.baseline_since,
                 baseline_until=args.baseline_until,
                 boot_id=args.boot_id,
-                since=args.since,
-                until=args.until,
+                since=since,
+                until=until,
                 target_label=args.target_label,
                 columns=args.columns,
                 control_for=args.control_for,
@@ -861,8 +863,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 baseline_since=args.baseline_since,
                 baseline_until=args.baseline_until,
                 boot_id=args.boot_id,
-                since=args.since,
-                until=args.until,
+                since=since,
+                until=until,
                 target_label=args.target_label,
                 eval_label=args.eval_label,
                 columns=args.columns,

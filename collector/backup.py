@@ -36,12 +36,26 @@ def verify_database(db: str | pathlib.Path) -> dict:
             if table in existing
         }
         journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    db_bytes = path.stat().st_size
+    wal_path = path.with_name(path.name + "-wal")
+    shm_path = path.with_name(path.name + "-shm")
+    wal_bytes = wal_path.stat().st_size if wal_path.exists() else 0
+    shm_bytes = shm_path.stat().st_size if shm_path.exists() else 0
+    total_bytes = db_bytes + wal_bytes + shm_bytes
+    n_samples = counts.get("samples", 0)
     return {
         "path": str(path),
         "quick_check": quick_check,
         "journal_mode": journal_mode,
         "missing_tables": missing,
         "counts": counts,
+        "size": {
+            "db_bytes": db_bytes,
+            "wal_bytes": wal_bytes,
+            "shm_bytes": shm_bytes,
+            "total_bytes": total_bytes,
+            "bytes_per_sample": total_bytes / n_samples if n_samples else None,
+        },
         "ok": quick_check == "ok" and not missing,
     }
 
@@ -106,7 +120,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 print(json.dumps(result, ensure_ascii=False, indent=2))
             else:
                 counts = ", ".join(f"{k}={v}" for k, v in result["counts"].items())
-                print(f"base valide ({result['journal_mode']}) : {counts}")
+                size_kb = result["size"]["total_bytes"] / 1024.0
+                print(f"base valide ({result['journal_mode']}, {size_kb:.1f} KiB) : {counts}")
             return
         destination = backup_database(args.db, args.output, timeout=args.timeout)
     except (ValueError, OSError, sqlite3.Error) as exc:

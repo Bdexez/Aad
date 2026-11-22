@@ -91,6 +91,7 @@ python -m collector.analyze --db data/metrics.db --drift --slices 2
 python -m collector.analyze --db data/metrics.db --by is_gaming
 python -m collector.analyze --db data/metrics.db --check-bounds
 python -m collector.analyze --db data/metrics.db --stuck-runs --min-run 30
+python -m collector.analyze --db data/metrics.db --changepoints k10temp_tctl --window 30
 python -m collector.analyze --db data/metrics.db --check-labels
 python -m collector.html_report --db data/metrics.db --baseline-label normal --output data/report.html
 python -m collector.analyze --db data/metrics.db --last-minutes 60 --json
@@ -124,6 +125,8 @@ python -m collector.features --db data/metrics.db --deltas --rolling 30 --decode
 ```bash
 python -m collector.backup --db data/metrics.db --output data/metrics-backup.db
 python -m collector.backup --db data/metrics-backup.db --verify --json
+python -m collector.retention --db data/metrics.db --keep-days 30           # dry-run by default
+python -m collector.merge --output merged.db part1.db part2.db
 ```
 
 The SQLite backup includes committed WAL transactions while collection continues, checks the copy and produces a standalone database file. It refuses to overwrite existing files. `--timeout` limits copying (30 seconds by default); pending samples still buffered in RAM are included only after the collector flushes them.
@@ -190,6 +193,8 @@ The suite exercises fake `/proc` and `/sys` trees, sensor discovery, counter wra
 | [`collector/html_report.py`](collector/html_report.py) | Standalone offline HTML campaign report with SVG sparklines |
 | [`collector/analyze.py`](collector/analyze.py) | Exploratory statistics, cadence, drift, outliers and label audits |
 | [`collector/detector.py`](collector/detector.py) | Zero-dependency explainable baseline anomaly detector |
-| [`collector/backup.py`](collector/backup.py) | Consistent backup while collection continues |
+| [`collector/backup.py`](collector/backup.py) | Consistent backup and read-only verification |
+| [`collector/retention.py`](collector/retention.py) | Safe database pruning with dry-run default |
+| [`collector/merge.py`](collector/merge.py) | Safe multi-database consolidation with schema union |
 
 Coverage is hardware-dependent. Software counters cannot expose every physical failure, and heuristic workload labels need interpretation. The [complete reference](docs/REFERENCE.md) documents measurement limits, experiment protocols and machine-specific coverage.

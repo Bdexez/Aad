@@ -44,6 +44,12 @@ class UnifiedCliEntryPointTest(unittest.TestCase):
             cli_entry.main(["features", "--db", str(self.db), "--format", "jsonl", "--deltas"])
         self.assertEqual(len(out.getvalue().splitlines()), 2)
 
+        with redirect_stdout(io.StringIO()) as out:
+            cli_entry.main(["summary", "--db", str(self.db), "--json"])
+        payload = json.loads(out.getvalue())
+        self.assertTrue(payload["healthy"])
+        self.assertEqual(payload["samples"]["count"], 2)
+
     def test_unknown_command_exits_cleanly_with_code_2(self):
         with redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as exc:
             cli_entry.main(["does-not-exist"])

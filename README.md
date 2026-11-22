@@ -41,8 +41,9 @@ Annotate an experiment in a second terminal:
 ```bash
 python -m collector.label start baseline -n "normal cooling, usual workload"
 python -m collector.label end
-python -m collector.label list
-python -m collector.label list --all
+python -m collector.label list --all --json
+python -m collector.label export --output labels.json
+python -m collector.label import labels.json
 ```
 
 For unattended collection, see the [systemd unit](systemd/aad-collector.service). Optional NVIDIA support uses `nvidia-ml-py`; the rest of the collector can run with the standard library.
@@ -88,9 +89,11 @@ python -m collector.analyze --db data/metrics.db --correlate k10temp_tctl
 python -m collector.analyze --db data/metrics.db --outliers --z-threshold 3.5
 python -m collector.analyze --db data/metrics.db --drift --slices 2
 python -m collector.analyze --db data/metrics.db --by is_gaming
+python -m collector.analyze --db data/metrics.db --check-bounds
+python -m collector.analyze --db data/metrics.db --stuck-runs --min-run 30
 python -m collector.analyze --db data/metrics.db --check-labels
-python -m collector.html_report --db data/metrics.db --output data/report.html
-python -m collector.analyze --db data/metrics.db --boot BOOT_ID --json
+python -m collector.html_report --db data/metrics.db --baseline-label normal --output data/report.html
+python -m collector.analyze --db data/metrics.db --last-minutes 60 --json
 ```
 
 The analyzer runs on a read-only SQLite snapshot without migrating the database. It reports per-boot sampling intervals (median, p95, gaps, duplicate timestamps and clock regressions), SQL-computed numeric `min`/`max`/`mean`/`std` with constant-sensor flags, per-label sample and event counts, standardized shifts (`z_shift`) between two labelled experiments, pairwise Pearson correlations (`--correlate`), robust median/MAD + IQR outlier diagnostics (`--outliers`), temporal drift across slices (`--drift`), and label quality audits (`--check-labels`).

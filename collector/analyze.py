@@ -1627,6 +1627,100 @@ def event_impact(
     }
 
 
+_CORE_UTIL_RE = re.compile(r"^cpu(\d+)_util$")
+
+
+def analyze_core_skew(
+    db: str | pathlib.Path,
+    *,
+    boot_id: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+    skew_threshold: float = 0.5,
+) -> dict:
+    """Mesure l'asymétrie inter-cœurs (`cpu0_util..cpuN_util`) masquée par `cpu_util`.
+
+    Calcule à chaque tick l'amplitude `max - min` entre cœurs et comptabilise
+    les ticks fortement asymétriques (`spread >= skew_threshold`) ainsi que la
+    fréquence à laquelle chaque cœur est le plus ou le moins chargé.
+    """
+    if not math.isfinite(skew_threshold) or not (0.0 < skew_threshold <= 1.0):
+        raise ValueError("--skew-threshold doit être dans ]0, 1]")
+    validate_time_range(since, until)
+    where, params = sample_filter_sql(boot_id=boot_id, since=since, until=until, alias="s")
+    with read_snapshot(db) as conn:
+        metrics, _ = _numeric_metrics(conn)
+        core_matches = [
+            (int(m.group(1)), name)
+            for name, _ in metrics
+            if (m := _CORE_UTIL_RE.fullmatch(name))
+        ]
+        core_matches.sort()
+        cores = [name for _, name in core_matches]
+        if len(cores) < 2:
+            return {
+                "boot_id": boot_id,
+                "window": {"since": since, "until": until},
+                "skew_threshold": skew_threshold,
+                "cores_found": len(cores),
+                "samples_evaluated": 0,
+                "skewed_samples": 0,
+                "skewed_pct": None,
+                "mean_spread": None,
+                "max_spread": None,
+                "cores": [],
+            }
+        proj = ", ".join(f"s.{quote_identifier(c)}" for c in cores)
+        cursor = conn.execute(f"SELECT {proj} FROM samples AS s{where}", params)
+        n_eval = 0
+        skewed = 0
+        spread_sum = 0.0
+        max_spread = 0.0
+        core_sums = [0.0] * len(cores)
+        core_counts = [0] * len(cores)
+        max_hits = [0] * len(cores)
+        min_hits = [0] * len(cores)
+        for row in cursor:
+            obs = [(i, float(v)) for i, v in enumerate(row) if v is not None]
+            if len(obs) < 2:
+                continue
+            n_eval += 1
+            for i, v in obs:
+                core_sums[i] += v
+                core_counts[i] += 1
+            hi_idx, hi_val = max(obs, key=lambda item: item[1])
+            lo_idx, lo_val = min(obs, key=lambda item: item[1])
+            spread = hi_val - lo_val
+            spread_sum += spread
+            if spread > max_spread:
+                max_spread = spread
+            if spread >= skew_threshold:
+                skewed += 1
+                max_hits[hi_idx] += 1
+                min_hits[lo_idx] += 1
+
+    return {
+        "boot_id": boot_id,
+        "window": {"since": since, "until": until},
+        "skew_threshold": skew_threshold,
+        "cores_found": len(cores),
+        "samples_evaluated": n_eval,
+        "skewed_samples": skewed,
+        "skewed_pct": _percentage(skewed, n_eval),
+        "mean_spread": (spread_sum / n_eval) if n_eval else None,
+        "max_spread": max_spread if n_eval else None,
+        "cores": [
+            {
+                "column": col,
+                "mean_util": (core_sums[i] / core_counts[i]) if core_counts[i] else None,
+                "hottest_in_skewed": max_hits[i],
+                "coldest_in_skewed": min_hits[i],
+            }
+            for i, col in enumerate(cores)
+        ],
+    }
+
+
 def _fmt(value: float | None, digits: int = 2) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
 
@@ -1696,6 +1790,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="pourcentage minimal au min/max pour --clipping (défaut : 10.0)")
     parser.add_argument("--impact-window-ms", type=int, default=30_000,
                         help="demi-fenêtre avant/après en ms pour --event-impact (défaut : 30000)")
+    parser.add_argument("--skew-threshold", type=float, default=0.5,
+                        help="écart max-min d'utilisation inter-cœurs pour --core-skew (défaut : 0.5)")
     parser.add_argument("--columns", nargs="+", help="sous-ensemble de métriques (pour --outliers, --by, --stuck-runs, --collinear, --missing-blocks, --clipping)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--compare", nargs=2, metavar=("BASELINE", "TARGET"),
@@ -1730,6 +1826,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                       help="comparer les métriques numériques entre deux boots")
     mode.add_argument("--event-impact", metavar="KIND",
                       help="comparer les métriques avant vs après les événements d'un genre donné")
+    mode.add_argument("--core-skew", action="store_true",
+                      help="mesurer l'asymétrie d'utilisation entre cœurs CPU (cpu0_util..cpuN_util)")
     output_fmt = parser.add_mutually_exclusive_group()
     output_fmt.add_argument("--json", action="store_true", help="sortie JSON pour les scripts")
     output_fmt.add_argument("--markdown", action="store_true",
@@ -1739,7 +1837,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.compare, args.correlate, args.outliers, args.check_labels,
         args.drift, args.by, args.check_bounds, args.stuck_runs, args.changepoints,
         args.collinear, args.missing_blocks, args.lag_correlate, args.clipping,
-        args.thermal_profile, args.compare_boots, args.event_impact,
+        args.thermal_profile, args.compare_boots, args.event_impact, args.core_skew,
     )):
         parser.error("--markdown s'applique uniquement au mode exploratoire par défaut")
 
@@ -1826,6 +1924,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.db, args.event_impact, window_ms=args.impact_window_ms,
                 boot_id=boot_id, since=since, until=until,
             )
+        elif args.core_skew:
+            result = analyze_core_skew(
+                args.db, boot_id=boot_id, since=since, until=until,
+                skew_threshold=args.skew_threshold,
+            )
         else:
             result = analyze_dataset(
                 args.db, boot_id=boot_id, since=since,
@@ -1840,6 +1943,19 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.markdown:
         print(format_markdown(result))
+        return
+
+    if args.core_skew:
+        print(
+            f"Asymétrie inter-cœurs ({result['cores_found']} cœurs, seuil >= {result['skew_threshold']}) : "
+            f"{result['skewed_samples']}/{result['samples_evaluated']} ({_fmt(result['skewed_pct'], 1)} %), "
+            f"écart moy={_fmt(result['mean_spread'])}, max={_fmt(result['max_spread'])}"
+        )
+        for c in result["cores"]:
+            print(
+                f"  {c['column']} : moy={_fmt(c['mean_util'])}, "
+                f"max_skew={c['hottest_in_skewed']}, min_skew={c['coldest_in_skewed']}"
+            )
         return
 
     if args.event_impact:

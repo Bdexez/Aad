@@ -94,9 +94,13 @@ python -m collector.analyze --db data/metrics.db --stuck-runs --min-run 30
 python -m collector.analyze --db data/metrics.db --missing-blocks --min-missing 5
 python -m collector.analyze --db data/metrics.db --changepoints k10temp_tctl --window 30
 python -m collector.analyze --db data/metrics.db --lag-correlate k10temp_tctl rapl_pkg_watts --max-lag 10
+python -m collector.analyze --db data/metrics.db --thermal-profile k10temp_tctl rapl_pkg_watts
+python -m collector.analyze --db data/metrics.db --clipping --clip-pct 10
 python -m collector.analyze --db data/metrics.db --collinear --r-threshold 0.95
+python -m collector.analyze --db data/metrics.db --event-impact thermal_trip
+python -m collector.analyze --db data/metrics.db --compare-boots BOOT_A BOOT_B
 python -m collector.analyze --db data/metrics.db --check-labels
-python -m collector.summary --db data/metrics.db --json
+python -m collector.summary --db data/metrics.db --markdown
 python -m collector.html_report --db data/metrics.db --baseline-label normal --output data/report.html
 python -m collector.analyze --db data/metrics.db --last-minutes 60 --json
 ```

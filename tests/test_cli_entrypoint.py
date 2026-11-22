@@ -49,6 +49,7 @@ class UnifiedCliEntryPointTest(unittest.TestCase):
         payload = json.loads(out.getvalue())
         self.assertTrue(payload["healthy"])
         self.assertEqual(payload["samples"]["count"], 2)
+        self.assertGreater(payload["storage_projection"]["estimated_mib_per_day"], 0)
 
     def test_unknown_command_exits_cleanly_with_code_2(self):
         with redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as exc:
